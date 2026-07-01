@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "stripCommentaryText": false,
+  "foldCompletedTurnProcess": true,
+  "foldUnsignedFinalSections": true,
+  "deriveFoldGroupsOnRender": false,
+  "auditHiddenCommentary": true,
+  "auditMaxTextChars": 200000,
+  "patchAssistantRenderer": true,
+  "showHiddenCommentaryMarker": true,
+  "hiddenCommentaryMarker": "[commentary hidden: {count} block(s); press {shortcut} for summary below]",
+  "hiddenSummaryShortcut": "",
+  "turnProcessFoldShortcut": "alt+p",
+  "processFoldMarker": "[process {state}: {total} entries: {details}; press {shortcut} to {action} latest]",
+  "assistantMessageModulePath": "",
+  "interactiveModeModulePath": "",
+  "collapseToolOutput": false,
+  "hideWorkingRow": false,
+  "hiddenThinkingLabel": "Thinking hidden",
+  "workingMessage": "working…"
+}

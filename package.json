@@ -1,0 +1,16 @@
+{
+  "name": "pi-codex-compact",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex-style compact rendering for Pi: hide OpenAI Responses commentary text while preserving final answers and tool calls.",
+  "scripts": {
+    "check": "node --check index.js && node --check index.cjs && node --check smoke-test.mjs",
+    "test": "node smoke-test.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./index.cjs"
+    ]
+  }
+}
