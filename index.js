@@ -24,6 +24,8 @@ const RENDER_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer
 const INTERACTIVE_PATCH_SYMBOL = Symbol.for("pi-codex-compact.interactive-render-patched");
 const INTERACTIVE_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.interactive-render-patch-data");
 const INTERACTIVE_INSTANCE_SYMBOL = Symbol.for("pi-codex-compact.interactive-instance");
+const REGISTRATION_KEY = Symbol.for("pi-codex-compact.registration");
+const INSTANCE_ID = `${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(EXTENSION_DIR, "config.json");
 
@@ -1358,6 +1360,10 @@ async function formatDoctorReport(config) {
 }
 
 export default function piCodexCompact(pi) {
+  const state = globalThis;
+  if (typeof state[REGISTRATION_KEY] === "string") return;
+  state[REGISTRATION_KEY] = INSTANCE_ID;
+
   let config = loadConfig();
 
   pi.on("session_start", async (_event, ctx) => {
@@ -1423,6 +1429,12 @@ export default function piCodexCompact(pi) {
       handler: (ctx) => toggleLatestHiddenCommentarySummary(ctx, config),
     });
   }
+
+  pi.on("session_shutdown", () => {
+    if (state[REGISTRATION_KEY] === INSTANCE_ID) {
+      delete state[REGISTRATION_KEY];
+    }
+  });
 
   pi.registerCommand("codex-compact", {
     description: "Show, reload, or toggle Codex-style compact display settings.",
