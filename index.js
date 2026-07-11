@@ -1,24 +1,11 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { appendFileSync } from "node:fs";
-
-// Diagnostic logger: writes to /tmp/codex-compact-debug.log with timestamp.
-// Keep disabled by default; flip temporarily when diagnosing fold issues.
-const DEBUG_FOLD = false;
-const DEBUG_LOG_PATH = "/tmp/codex-compact-debug.log";
-function dbg(msg) {
-  if (!DEBUG_FOLD) return;
-  try {
-    appendFileSync(DEBUG_LOG_PATH, `${new Date().toISOString()} ${msg}\n`);
-  } catch {}
-}
 
 const AUDIT_ENTRY_TYPE = "pi-codex-compact.hidden-commentary";
-const PROCESS_GROUP_ENTRY_TYPE = "pi-codex-compact.process-group";
 const HIDDEN_SUMMARY_WIDGET_KEY = "pi-codex-compact.hidden-summary";
-const RENDER_PATCH_VERSION = 3;
-const INTERACTIVE_PATCH_VERSION = 5;
+const RENDER_PATCH_VERSION = 4;
+const INTERACTIVE_PATCH_VERSION = 8;
 const RENDER_PATCH_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patched");
 const RENDER_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patch-data");
 const INTERACTIVE_PATCH_SYMBOL = Symbol.for("pi-codex-compact.interactive-render-patched");
@@ -32,17 +19,15 @@ const CONFIG_PATH = join(EXTENSION_DIR, "config.json");
 const DEFAULT_CONFIG = {
   enabled: true,
   stripCommentaryText: false,
-  foldCompletedTurnProcess: true,
-  foldUnsignedFinalSections: true,
-  deriveFoldGroupsOnRender: false,
+  foldCompletedToolBatches: true,
+  toolBatchFoldShortcut: "alt+p",
+  toolBatchFoldMarker: "⌕ {summary}{errors}  {chevron}",
   auditHiddenCommentary: true,
   auditMaxTextChars: 200000,
-  patchAssistantRenderer: true,
+  patchInternalRenderers: true,
   showHiddenCommentaryMarker: true,
   hiddenCommentaryMarker: "[commentary hidden: {count} block(s); press {shortcut} for summary below]",
   hiddenSummaryShortcut: "",
-  turnProcessFoldShortcut: "alt+p",
-  processFoldMarker: "[process {state}: {total} entries: {details}; press {shortcut} to {action} latest]",
   assistantMessageModulePath: "",
   interactiveModeModulePath: "",
   collapseToolOutput: false,
@@ -60,11 +45,9 @@ function normalizeConfig(rawConfig) {
   for (const key of [
     "enabled",
     "stripCommentaryText",
-    "foldCompletedTurnProcess",
-    "foldUnsignedFinalSections",
-    "deriveFoldGroupsOnRender",
+    "foldCompletedToolBatches",
     "auditHiddenCommentary",
-    "patchAssistantRenderer",
+    "patchInternalRenderers",
     "showHiddenCommentaryMarker",
     "collapseToolOutput",
     "hideWorkingRow",
@@ -74,10 +57,29 @@ function normalizeConfig(rawConfig) {
     }
   }
 
-  for (const key of ["assistantMessageModulePath", "interactiveModeModulePath", "hiddenCommentaryMarker", "hiddenSummaryShortcut", "turnProcessFoldShortcut", "processFoldMarker", "hiddenThinkingLabel", "workingMessage"]) {
+  for (const key of [
+    "assistantMessageModulePath",
+    "interactiveModeModulePath",
+    "hiddenCommentaryMarker",
+    "hiddenSummaryShortcut",
+    "toolBatchFoldShortcut",
+    "toolBatchFoldMarker",
+    "hiddenThinkingLabel",
+    "workingMessage",
+  ]) {
     if (typeof rawConfig[key] === "string") {
       config[key] = rawConfig[key];
     }
+  }
+
+  if (typeof rawConfig.toolBatchFoldShortcut !== "string" && typeof rawConfig.turnProcessFoldShortcut === "string") {
+    config.toolBatchFoldShortcut = rawConfig.turnProcessFoldShortcut;
+  }
+  if (typeof rawConfig.toolBatchFoldMarker !== "string" && typeof rawConfig.processFoldMarker === "string") {
+    config.toolBatchFoldMarker = rawConfig.processFoldMarker;
+  }
+  if (typeof rawConfig.patchInternalRenderers !== "boolean" && typeof rawConfig.patchAssistantRenderer === "boolean") {
+    config.patchInternalRenderers = rawConfig.patchAssistantRenderer;
   }
 
   if (Number.isFinite(rawConfig.auditMaxTextChars) && rawConfig.auditMaxTextChars > 0) {
@@ -141,14 +143,27 @@ function collectCommentaryTextBlocks(message) {
 }
 
 function truncateText(text, maxChars) {
-  if (typeof text !== "string" || text.length <= maxChars) {
-    return { text, truncated: false, originalLength: typeof text === "string" ? text.length : 0 };
+  if (typeof text !== "string") {
+    return { text, truncated: false, originalLength: 0 };
+  }
+
+  const prefix = [];
+  let originalLength = 0;
+  for (const character of text) {
+    if (originalLength < maxChars) {
+      prefix.push(character);
+    }
+    originalLength += 1;
+  }
+
+  if (originalLength <= maxChars) {
+    return { text, truncated: false, originalLength };
   }
 
   return {
-    text: text.slice(0, maxChars),
+    text: prefix.join(""),
     truncated: true,
-    originalLength: text.length,
+    originalLength,
   };
 }
 
@@ -241,296 +256,233 @@ function prepareMessageForRendering(message, config) {
     return message;
   }
 
+  if (!hasDisplayableAssistantContent(filteredContent)) {
+    return message;
+  }
+
   return {
     ...message,
     content: addHiddenCommentaryMarker(filteredContent, hiddenCount, config),
   };
 }
 
-function isFinalAnswerTextBlock(block) {
-  if (!block || block.type !== "text") {
-    return false;
-  }
+let expandedToolBatchKey = null;
+let activeToolBatchKey = null;
+let lastInteractiveModeInstance;
+let lastRenderedToolBatches = [];
+let rawToolBatchInputUnsubscribe;
+let patchedAssistantPrototype;
+let patchedInteractivePrototype;
+let toolsExpandedBeforeEnable;
+let toolsExpandedCaptured = false;
 
-  return parseTextSignature(block.textSignature)?.phase === "final_answer";
+function resetToolBatchFoldState() {
+  expandedToolBatchKey = null;
+  activeToolBatchKey = null;
+  lastRenderedToolBatches = [];
 }
 
-function getFinalAnswerTextBlocks(message) {
+function isToolBatchFoldingEnabled(config) {
+  return Boolean(
+    config?.enabled
+    && config.patchInternalRenderers
+    && config.foldCompletedToolBatches,
+  );
+}
+
+function getToolCalls(message) {
   if (message?.role !== "assistant" || !Array.isArray(message.content)) {
     return [];
   }
-
-  return message.content.filter(isFinalAnswerTextBlock);
+  return message.content.filter((block) => block?.type === "toolCall");
 }
 
-function splitUnsignedFinalSectionText(text) {
-  if (typeof text !== "string") {
+function toolBatchKey(message, calls) {
+  if (typeof message?.responseId === "string" && message.responseId.length > 0) {
+    return `tool_batch_response_${stableHash(message.responseId)}`;
+  }
+  if (message?.timestamp === undefined || message?.timestamp === null) {
+    return undefined;
+  }
+  return `tool_batch_${stableHash(`${String(message.timestamp)}:${calls.map((call) => call.id).join(",")}`)}`;
+}
+
+function toolCategory(toolName) {
+  const normalized = String(toolName ?? "").toLowerCase().split(/[.:/]/).at(-1);
+  if (normalized === "read") {
+    return "read";
+  }
+  if (["grep", "rg", "ffgrep", "find", "fffind", "fast_context_search", "search"].includes(normalized)) {
+    return "search";
+  }
+  if (normalized === "bash") {
+    return "command";
+  }
+  if (normalized === "edit" || normalized === "write") {
+    return "modify";
+  }
+  return "other";
+}
+
+function inspectToolBatch(message, results) {
+  const calls = getToolCalls(message);
+  if (calls.length === 0) {
     return undefined;
   }
 
-  const patterns = [
-    /\n\s*-{3,}\s*\n+(?=(?:#{1,6}\s*)?(?:✅\s*)?(?:结论|总结|最终结论|最终答案|答案|Final Answer|Conclusion|Answer))/i,
-    /\n\s*#{1,6}\s*(?:✅\s*)?(?:结论|总结|最终结论|最终答案|答案|Final Answer|Conclusion|Answer)/i,
-    /\n\s*(?:✅\s*)?(?:结论|总结|最终结论|最终答案|答案|Final Answer|Conclusion|Answer)[：:]/i,
-  ];
+  const callIds = new Set();
+  for (const call of calls) {
+    if (typeof call?.id !== "string" || call.id.length === 0 || callIds.has(call.id)) {
+      return { valid: false, complete: false, calls, results: [] };
+    }
+    callIds.add(call.id);
+  }
 
-  for (const pattern of patterns) {
-    const match = pattern.exec(text);
-    if (!match) {
+  const key = toolBatchKey(message, calls);
+  if (!key || message.stopReason !== "toolUse") {
+    return { valid: false, complete: false, calls, results: [] };
+  }
+
+  const resultMap = new Map();
+  for (const result of Array.isArray(results) ? results : []) {
+    const resultId = result?.toolCallId;
+    if (result?.role !== "toolResult" || !callIds.has(resultId) || resultMap.has(resultId)) {
+      return { valid: false, complete: false, key, calls, results: [] };
+    }
+    resultMap.set(resultId, result);
+  }
+
+  const counts = { total: calls.length, read: 0, search: 0, command: 0, modify: 0, other: 0, errors: 0 };
+  for (const call of calls) {
+    counts[toolCategory(call.name)] += 1;
+  }
+  for (const result of resultMap.values()) {
+    if (result.isError === true) {
+      counts.errors += 1;
+    }
+  }
+
+  return {
+    valid: true,
+    complete: resultMap.size === calls.length,
+    key,
+    message,
+    calls,
+    results: [...resultMap.values()],
+    counts,
+  };
+}
+
+function scanToolBatches(items) {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  const batches = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const message = items[index];
+    if (getToolCalls(message).length === 0) {
       continue;
     }
 
-    const finalStart = match.index + match[0].length;
-    const processText = text.slice(0, match.index).trim();
-    const finalText = text.slice(finalStart).trimStart();
-    if (processText.length > 0 && finalText.length > 0) {
-      return { finalStart, processText, finalText, marker: match[0] };
-    }
-  }
-
-  return undefined;
-}
-
-function findUnsignedFinalSection(message, config) {
-  if (!config?.foldUnsignedFinalSections || message?.role !== "assistant" || !Array.isArray(message.content)) {
-    return undefined;
-  }
-
-  for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex -= 1) {
-    const block = message.content[blockIndex];
-    if (block?.type !== "text") {
-      continue;
-    }
-    const split = splitUnsignedFinalSectionText(block.text);
-    if (!split) {
-      continue;
-    }
-
-    return {
-      blockIndex,
-      split,
-      finalBlocks: [{ ...block, text: split.finalText }],
-    };
-  }
-
-  return undefined;
-}
-
-function isFailureStopReason(stopReason) {
-  return stopReason === "error" || stopReason === "aborted" || stopReason === "timeout";
-}
-
-function isNormalCompletionStopReason(stopReason) {
-  return stopReason === "stop" || stopReason === "length" || stopReason === "end_turn";
-}
-
-function processGroupId() {
-  return `pg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function signatureIdsForBlocks(blocks) {
-  return blocks
-    .map((block) => parseTextSignature(block.textSignature)?.id)
-    .filter((id) => typeof id === "string" && id.length > 0);
-}
-
-function countProcessMessageContent(message, finalBlocks = [], unsignedFinalSection) {
-  const counts = { assistant: 0, thinking: 0, toolCalls: 0, toolResults: 0, custom: 0 };
-  if (!message) {
-    return counts;
-  }
-
-  if (message.role === "toolResult") {
-    counts.toolResults += 1;
-    return counts;
-  }
-
-  if (message.role === "custom") {
-    counts.custom += 1;
-    return counts;
-  }
-
-  if (message.role !== "assistant" || !Array.isArray(message.content)) {
-    return counts;
-  }
-
-  const finalBlockSet = new Set(finalBlocks);
-  for (const [blockIndex, block] of message.content.entries()) {
-    if (finalBlockSet.has(block)) {
-      continue;
-    }
-    if (unsignedFinalSection?.blockIndex === blockIndex && block.type === "text") {
-      if (unsignedFinalSection.split?.processText?.trim()) {
-        counts.assistant += 1;
+    const results = [];
+    for (let resultIndex = index + 1; resultIndex < items.length; resultIndex += 1) {
+      const candidate = items[resultIndex];
+      if (candidate?.role === "assistant" || candidate?.role === "user") {
+        break;
       }
-      continue;
+      if (candidate?.role === "toolResult") {
+        results.push(candidate);
+      }
     }
-    if (block.type === "toolCall") {
-      counts.toolCalls += 1;
-    } else if (block.type === "thinking") {
-      counts.thinking += 1;
-    } else if (block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0) {
-      counts.assistant += 1;
+
+    const batch = inspectToolBatch(message, results);
+    if (batch?.valid && batch.complete) {
+      batches.push({ ...batch, assistantIndex: index });
     }
   }
 
-  return counts;
-}
-
-function mergeCounts(target, source) {
-  for (const [key, value] of Object.entries(source)) {
-    target[key] = (target[key] ?? 0) + value;
+  // 稳定键冲突时无法安全切换单个批次，保守保持展开。
+  const keyCounts = new Map();
+  for (const batch of batches) {
+    keyCounts.set(batch.key, (keyCounts.get(batch.key) ?? 0) + 1);
   }
-  return target;
+
+  return batches.filter((batch) => keyCounts.get(batch.key) === 1);
 }
 
-function totalProcessCount(counts) {
-  return Object.values(counts).reduce((total, value) => total + (Number.isFinite(value) ? value : 0), 0);
-}
-
-function formatProcessCountDetails(counts) {
-  const labels = [
-    ["assistant", "assistant"],
-    ["thinking", "thinking"],
-    ["toolCalls", "tool calls"],
-    ["toolResults", "tool results"],
-    ["custom", "custom"],
-  ];
+function formatToolBatchSummary(batch) {
+  const counts = batch?.counts ?? {};
   const parts = [];
-  for (const [key, label] of labels) {
-    const count = counts?.[key] ?? 0;
-    if (count > 0) {
-      parts.push(`${count} ${label}`);
-    }
-  }
-  return parts.length > 0 ? parts.join(", ") : "no process items";
+  if (counts.read > 0) parts.push(`已读取 ${counts.read} 个文件`);
+  if (counts.search > 0) parts.push(`搜索 ${counts.search} 次`);
+  if (counts.command > 0) parts.push(`运行 ${counts.command} 个命令`);
+  if (counts.modify > 0) parts.push(`修改 ${counts.modify} 次`);
+  if (counts.other > 0) parts.push(`调用 ${counts.other} 个其他工具`);
+  return parts.join("、");
 }
 
-function formatProcessFoldMarker(group, config, expanded) {
-  const template = config.processFoldMarker || DEFAULT_CONFIG.processFoldMarker;
-  const total = group?.counts?.total ?? totalProcessCount(group?.counts ?? {});
-  const shortcut = config.turnProcessFoldShortcut || "F8";
+function formatToolBatchFoldMarker(batch, config) {
+  const template = config.toolBatchFoldMarker || DEFAULT_CONFIG.toolBatchFoldMarker;
+  const summary = formatToolBatchSummary(batch);
+  const errors = `；${batch.counts.errors} 个错误`;
   return template
-    .replaceAll("{state}", expanded ? "shown" : "hidden")
-    .replaceAll("{total}", String(total))
-    .replaceAll("{details}", formatProcessCountDetails(group?.counts ?? {}))
-    .replaceAll("{shortcut}", shortcut)
-    .replaceAll("{action}", expanded ? "hide" : "show");
+    .replaceAll("{summary}", summary)
+    .replaceAll("{errors}", errors)
+    .replaceAll("{chevron}", "▾")
+    .replaceAll("{state}", "hidden")
+    .replaceAll("{total}", String(batch.counts.total))
+    .replaceAll("{details}", `${summary}${errors}`)
+    .replaceAll("{shortcut}", config.toolBatchFoldShortcut || "alt+p")
+    .replaceAll("{action}", "show");
 }
 
-function createProcessMarkerMessage(group, config, expanded) {
-  return {
-    role: "assistant",
-    content: [{ type: "text", text: formatProcessFoldMarker(group, config, expanded) }],
-    timestamp: group?.createdAt ?? new Date().toISOString(),
-    stopReason: "end_turn",
-  };
-}
-
-function getFinalAnswerContentForRendering(message, config) {
-  const finalSection = findUnsignedFinalSection(message, config);
-  if (finalSection?.finalBlocks?.length > 0) {
-    return finalSection.finalBlocks;
+function prepareItemsForToolBatchFolding(items, config) {
+  if (!config.enabled || !config.foldCompletedToolBatches || !Array.isArray(items)) {
+    lastRenderedToolBatches = [];
+    return items;
   }
 
-  return getFinalAnswerTextBlocks(message);
+  const batches = scanToolBatches(items);
+  lastRenderedToolBatches = batches.filter((batch) => batch.key !== activeToolBatchKey);
+  const collapsedByIndex = new Map(
+    lastRenderedToolBatches
+      .filter((batch) => batch.key !== expandedToolBatchKey)
+      .map((batch) => [batch.assistantIndex, batch]),
+  );
+  if (collapsedByIndex.size === 0) {
+    return items;
+  }
+
+  return items.map((item, index) => {
+    const batch = collapsedByIndex.get(index);
+    if (!batch) {
+      return item;
+    }
+
+    let markerAdded = false;
+    const content = item.content.flatMap((block) => {
+      if (block?.type !== "toolCall") {
+        return [block];
+      }
+      if (markerAdded) {
+        return [];
+      }
+      markerAdded = true;
+      return [{ type: "text", text: formatToolBatchFoldMarker(batch, config) }];
+    });
+    return { ...item, content };
+  });
 }
 
-function createFinalAnswerOnlyMessage(message, group, config) {
-  const finalContent = getFinalAnswerContentForRendering(message, config);
-  return {
-    ...message,
-    content: finalContent.length > 0 ? finalContent : message.content,
-  };
-}
-
-function getFinalAssistantCandidate(message, index, config) {
-  if (message?.role !== "assistant" || isFailureStopReason(message.stopReason) || !isNormalCompletionStopReason(message.stopReason)) {
+function isCompleteToolBatchEvent(event) {
+  if (event?.type !== "turn_end") {
     return undefined;
   }
 
-  const finalBlocks = getFinalAnswerTextBlocks(message);
-  const unsignedFinalSection = findUnsignedFinalSection(message, config);
-  if (unsignedFinalSection?.finalBlocks?.length > 0) {
-    return {
-      message,
-      index,
-      finalBlocks: unsignedFinalSection.finalBlocks,
-      unsignedFinalSection,
-      finalMode: finalBlocks.length > 0 ? "signed-final-section" : "unsigned-final-section",
-    };
-  }
-
-  if (finalBlocks.length > 0) {
-    return { message, index, finalBlocks, finalMode: "signed-final-answer" };
-  }
-
-  return undefined;
+  const batch = inspectToolBatch(event.message, event.toolResults);
+  return batch?.valid && batch.complete ? batch : undefined;
 }
-
-function findFinalAssistantMessage(messages, config) {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const candidate = getFinalAssistantCandidate(messages[index], index, config);
-    if (candidate) {
-      return candidate;
-    }
-  }
-  return undefined;
-}
-
-function messageMatchesProcessGroupFinal(message, group) {
-  if (message?.role !== "assistant" || !group?.final) {
-    return false;
-  }
-
-  if (group.final.responseId && message.responseId === group.final.responseId) {
-    return true;
-  }
-
-  if (group.final.timestamp && message.timestamp && group.final.timestamp !== message.timestamp) {
-    return false;
-  }
-
-  const expectedIds = Array.isArray(group.final.textSignatureIds) ? group.final.textSignatureIds : [];
-  if (expectedIds.length > 0) {
-    const actualIds = new Set(signatureIdsForBlocks(getFinalAnswerTextBlocks(message)));
-    return expectedIds.some((id) => actualIds.has(id));
-  }
-
-  if (!group.final.unsignedFinalSection || !group.final.timestamp || message.timestamp !== group.final.timestamp) {
-    return false;
-  }
-
-  const blockIndex = group.final.unsignedFinalSection.blockIndex;
-  const block = Array.isArray(message.content) ? message.content[blockIndex] : undefined;
-  const split = block?.type === "text" ? splitUnsignedFinalSectionText(block.text) : undefined;
-  const marker = group.final.unsignedFinalSection.marker;
-  return Boolean(split && (!marker || split.marker === marker));
-}
-
-function previousUserMessageIndex(messages, finalIndex) {
-  for (let index = finalIndex - 1; index >= 0; index--) {
-    if (messages[index]?.role === "user") {
-      return index;
-    }
-  }
-  return -1;
-}
-
-function getProcessGroupEntriesFromEntries(entries) {
-  return entries
-    .filter((entry) => entry.type === "custom" && entry.customType === PROCESS_GROUP_ENTRY_TYPE && entry.data)
-    .map((entry) => ({ ...entry.data, entryId: entry.id, entryTimestamp: entry.timestamp }));
-}
-
-function latestProcessGroup(groups) {
-  return groups.at(-1);
-}
-
-let expandedProcessGroupId = null;
-let lastInteractiveModeInstance;
-let lastRenderedProcessGroups = [];
-let rawProcessFoldInputUnsubscribe;
 
 function stableHash(value) {
   const text = String(value ?? "");
@@ -541,244 +493,66 @@ function stableHash(value) {
   return Math.abs(hash).toString(36);
 }
 
-function shouldPreferFoldRange(candidate, current) {
-  const candidateHasSplit = Boolean(candidate.group?.final?.unsignedFinalSection);
-  const currentHasSplit = Boolean(current.group?.final?.unsignedFinalSection);
-  if (candidateHasSplit !== currentHasSplit) {
-    return candidateHasSplit;
-  }
-
-  const candidateTotal = candidate.group?.counts?.total ?? 0;
-  const currentTotal = current.group?.counts?.total ?? 0;
-  if (candidateTotal !== currentTotal) {
-    return candidateTotal > currentTotal;
-  }
-
-  if (Boolean(candidate.group?.derived) !== Boolean(current.group?.derived)) {
-    return !candidate.group?.derived;
-  }
-
-  return false;
-}
-
-function buildFoldRanges(messages, groups) {
-  const rangesByKey = new Map();
-  dbg(`buildFoldRanges: messages=${messages?.length} groups=${groups?.length} expandedProcessGroupId=${expandedProcessGroupId}`);
-  for (const group of groups) {
-    const finalIndex = messages.findIndex((message) => messageMatchesProcessGroupFinal(message, group));
-    dbg(`buildFoldRanges group: groupId=${group?.groupId} finalIndex=${finalIndex} expanded=${expandedProcessGroupId === group?.groupId}`);
-    if (finalIndex < 0) {
-      dbg(`buildFoldRanges: SKIP group ${group?.groupId} (finalIndex<0)`);
-      continue;
-    }
-    const userIndex = previousUserMessageIndex(messages, finalIndex);
-    const startIndex = userIndex + 1;
-    if (startIndex > finalIndex) {
-      dbg(`buildFoldRanges: SKIP group ${group?.groupId} (startIndex>finalIndex ${startIndex}>${finalIndex})`);
-      continue;
-    }
-    const range = { group, startIndex, finalIndex, expanded: expandedProcessGroupId === group.groupId };
-    const key = `${startIndex}:${finalIndex}`;
-    const current = rangesByKey.get(key);
-    if (!current || shouldPreferFoldRange(range, current)) {
-      rangesByKey.set(key, range);
-    }
-  }
-
-  return [...rangesByKey.values()].sort((a, b) => a.startIndex - b.startIndex || a.finalIndex - b.finalIndex);
-}
-
-function buildProcessGroupFromFinal(messages, final, config, ctx, sourceKind = "agent_end") {
-  const userIndex = previousUserMessageIndex(messages, final.index);
-  const startIndex = userIndex + 1;
-  if (startIndex > final.index) {
-    return undefined;
-  }
-
-  const counts = { assistant: 0, thinking: 0, toolCalls: 0, toolResults: 0, custom: 0 };
-  for (let index = startIndex; index <= final.index; index += 1) {
-    mergeCounts(
-      counts,
-      countProcessMessageContent(
-        messages[index],
-        index === final.index ? final.finalBlocks : [],
-        index === final.index ? final.unsignedFinalSection : undefined,
-      ),
-    );
-  }
-  counts.total = totalProcessCount(counts);
-  if (counts.total <= 0) {
-    return undefined;
-  }
-
-  const finalSignatureIds = signatureIdsForBlocks(final.finalBlocks);
-  const stableRef = final.message.responseId || `${final.message.timestamp}:${finalSignatureIds.join(",")}:${final.index}`;
-  return {
-    version: 1,
-    groupId: sourceKind === "derived-render" ? `pg_derived_${stableHash(stableRef)}` : processGroupId(),
-    createdAt: new Date().toISOString(),
-    derived: sourceKind === "derived-render",
-    final: {
-      mode: final.finalMode,
-      responseId: final.message.responseId,
-      timestamp: final.message.timestamp,
-      provider: final.message.provider,
-      model: final.message.model,
-      stopReason: final.message.stopReason,
-      textSignatureIds: finalSignatureIds,
-      unsignedFinalSection: final.unsignedFinalSection
-        ? { blockIndex: final.unsignedFinalSection.blockIndex, marker: final.unsignedFinalSection.split?.marker }
-        : undefined,
-    },
-    counts,
-    source: {
-      kind: sourceKind,
-      sessionId: ctx?.sessionManager?.getSessionId?.(),
-      leafId: ctx?.sessionManager?.getLeafId?.(),
-    },
-  };
-}
-
-function shouldDerivedGroupOverrideExisting(derivedGroup, existingGroup) {
-  const derivedHasSplit = Boolean(derivedGroup?.final?.unsignedFinalSection);
-  const existingHasSplit = Boolean(existingGroup?.final?.unsignedFinalSection);
-  if (derivedHasSplit && !existingHasSplit) {
-    return true;
-  }
-
-  const derivedTotal = derivedGroup?.counts?.total ?? 0;
-  const existingTotal = existingGroup?.counts?.total ?? 0;
-  return derivedHasSplit && derivedTotal > existingTotal;
-}
-
-function buildDerivedProcessGroups(messages, existingGroups, config) {
-  if (!config.deriveFoldGroupsOnRender) {
-    return [];
-  }
-
-  const derived = [];
-  for (let index = 0; index < messages.length; index += 1) {
-    const candidate = getFinalAssistantCandidate(messages[index], index, config);
-    if (!candidate) {
-      continue;
-    }
-
-    const group = buildProcessGroupFromFinal(messages, candidate, config, undefined, "derived-render");
-    if (!group) {
-      continue;
-    }
-
-    const existing = existingGroups.find((existingGroup) => messageMatchesProcessGroupFinal(candidate.message, existingGroup));
-    if (existing && !shouldDerivedGroupOverrideExisting(group, existing)) {
-      continue;
-    }
-
-    derived.push(group);
-  }
-  return derived;
-}
-
-function prepareSessionContextForProcessFolding(sessionContext, entries, config) {
-  if (!config.enabled || !config.foldCompletedTurnProcess || !Array.isArray(sessionContext?.messages)) {
-    return sessionContext;
-  }
-
-  const persistedGroups = getProcessGroupEntriesFromEntries(entries);
-  const groups = [
-    ...persistedGroups,
-    ...buildDerivedProcessGroups(sessionContext.messages, persistedGroups, config),
-  ];
-  if (groups.length === 0) {
-    lastRenderedProcessGroups = [];
-    return sessionContext;
-  }
-
-  const ranges = buildFoldRanges(sessionContext.messages, groups);
-  lastRenderedProcessGroups = ranges.map((range) => range.group);
-  dbg(`prepareFold: groups=${groups.length} ranges=${ranges.length} expandedRanges=${ranges.filter(r => r.expanded).length}`);
-  for (const range of ranges) {
-    dbg(`prepareFold range: groupId=${range.group?.groupId} start=${range.startIndex} final=${range.finalIndex} expanded=${range.expanded}`);
-  }
-  if (ranges.length === 0) {
-    lastRenderedProcessGroups = [];
-    return sessionContext;
-  }
-
-  const messages = [];
-  let index = 0;
-  for (const range of ranges) {
-    if (range.startIndex < index) {
-      continue;
-    }
-
-    while (index < range.startIndex) {
-      messages.push(sessionContext.messages[index]);
-      index += 1;
-    }
-
-    messages.push(createProcessMarkerMessage(range.group, config, range.expanded));
-    if (range.expanded) {
-      while (index <= range.finalIndex) {
-        messages.push(sessionContext.messages[index]);
-        index += 1;
-      }
-    } else {
-      messages.push(createFinalAnswerOnlyMessage(sessionContext.messages[range.finalIndex], range.group, config));
-      index = range.finalIndex + 1;
-    }
-  }
-
-  while (index < sessionContext.messages.length) {
-    messages.push(sessionContext.messages[index]);
-    index += 1;
-  }
-
-  return {
-    ...sessionContext,
-    messages,
-  };
-}
-
-function buildProcessGroupEntry(event, ctx, config) {
-  const messages = event.messages ?? [];
-  const final = findFinalAssistantMessage(messages, config);
-  if (!final) {
-    return undefined;
-  }
-
-  return buildProcessGroupFromFinal(messages, final, config, ctx, "agent_end");
-}
-
-function hasProcessGroupForFinal(ctx, processGroup) {
-  const groups = getProcessGroupEntriesFromEntries(ctx?.sessionManager?.getEntries?.() ?? []);
-  return groups.some((group) => {
-    if (processGroup.final.responseId && group.final?.responseId === processGroup.final.responseId) {
-      return true;
-    }
-    const expected = new Set(processGroup.final.textSignatureIds ?? []);
-    return (group.final?.textSignatureIds ?? []).some((id) => expected.has(id));
-  });
-}
-
 function getInteractiveModeInstanceFromContext(ctx) {
   const instance = ctx?.ui?.[INTERACTIVE_INSTANCE_SYMBOL];
   return instance?.rebuildChatFromMessages ? instance : undefined;
 }
 
-function requestProcessFoldRerender(ctx) {
+function isStaleExtensionContextError(error) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  return message.includes("extension context no longer active")
+    || message.includes("extension ctx is stale");
+}
+
+function warnCompactUiFailure(label, error) {
+  if (isStaleExtensionContextError(error)) {
+    return;
+  }
+  console.warn(`codex-compact: ${label} failed: ${error instanceof Error ? error.message : String(error)}`);
+}
+
+function safeSessionManagerValue(sessionManager, method, fallback, label) {
+  try {
+    const fn = sessionManager?.[method];
+    return typeof fn === "function" ? fn.call(sessionManager) : fallback;
+  } catch (error) {
+    warnCompactUiFailure(label, error);
+    return fallback;
+  }
+}
+
+function safeSessionValue(ctx, method, fallback, label) {
+  return safeSessionManagerValue(ctx?.sessionManager, method, fallback, label);
+}
+
+function safeSessionManagerEntries(sessionManager) {
+  const entries = safeSessionManagerValue(sessionManager, "getEntries", [], "session entries read");
+  return Array.isArray(entries) ? entries : [];
+}
+
+function safeSessionEntries(ctx) {
+  return safeSessionManagerEntries(ctx?.sessionManager);
+}
+
+function requestToolBatchRerender(ctx) {
   const contextInstance = getInteractiveModeInstanceFromContext(ctx);
   const instance = contextInstance?.rebuildChatFromMessages
     ? contextInstance
     : lastInteractiveModeInstance;
-  dbg(`requestRerender: contextInstance=${contextInstance ? 'yes' : 'no'} hasRebuild=${!!contextInstance?.rebuildChatFromMessages} lastInstance=${lastInteractiveModeInstance ? 'yes' : 'no'}`);
   if (instance?.rebuildChatFromMessages) {
     lastInteractiveModeInstance = instance;
-    instance.rebuildChatFromMessages();
-    dbg(`requestRerender: rebuild called on instance`);
-    return true;
+    try {
+      instance.rebuildChatFromMessages();
+      return true;
+    } catch (error) {
+      warnCompactUiFailure("rebuild request", error);
+    }
   }
-  dbg(`requestRerender: NO instance, fallback requestRender`);
-  ctx?.ui?.requestRender?.();
+  safeUiCall(ctx, "requestRender");
   return false;
 }
 
@@ -800,9 +574,9 @@ function isRawShortcutInput(data, shortcut) {
   return false;
 }
 
-function unregisterProcessFoldTerminalInput() {
-  const unsubscribe = rawProcessFoldInputUnsubscribe;
-  rawProcessFoldInputUnsubscribe = undefined;
+function unregisterToolBatchTerminalInput() {
+  const unsubscribe = rawToolBatchInputUnsubscribe;
+  rawToolBatchInputUnsubscribe = undefined;
   if (typeof unsubscribe !== "function") {
     return;
   }
@@ -810,60 +584,56 @@ function unregisterProcessFoldTerminalInput() {
   try {
     unsubscribe();
   } catch (error) {
-    console.warn(`codex-compact: terminal input cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+    warnCompactUiFailure("terminal input cleanup", error);
   }
 }
 
-function registerProcessFoldTerminalInput(ctx, config) {
-  unregisterProcessFoldTerminalInput();
-  if (!config.enabled || !config.foldCompletedTurnProcess || !config.turnProcessFoldShortcut) {
-    return;
-  }
-  if (typeof ctx?.ui?.onTerminalInput !== "function") {
+function registerToolBatchTerminalInput(ctx, config) {
+  unregisterToolBatchTerminalInput();
+  if (!isToolBatchFoldingEnabled(config) || !config.toolBatchFoldShortcut) {
     return;
   }
 
-  rawProcessFoldInputUnsubscribe = ctx.ui.onTerminalInput((data) => {
-    if (!isRawShortcutInput(data, config.turnProcessFoldShortcut)) {
+  rawToolBatchInputUnsubscribe = safeOnTerminalInput(ctx, (data) => {
+    if (!isRawShortcutInput(data, config.toolBatchFoldShortcut)) {
       return undefined;
     }
-    toggleLatestProcessGroup(ctx, config);
+    toggleLatestToolBatch(ctx, config);
     return { consume: true };
   });
 }
 
-function getCurrentFoldableProcessGroups(ctx, config) {
-  const persistedGroups = getProcessGroupEntriesFromEntries(ctx?.sessionManager?.getEntries?.() ?? []);
-  const sessionContext = ctx?.sessionManager?.buildSessionContext?.();
-  if (Array.isArray(sessionContext?.messages)) {
-    const groups = [
-      ...persistedGroups,
-      ...buildDerivedProcessGroups(sessionContext.messages, persistedGroups, config),
-    ];
-    return buildFoldRanges(sessionContext.messages, groups).map((range) => range.group);
+function getCurrentFoldableToolBatches(ctx) {
+  if (lastRenderedToolBatches.length > 0) {
+    return lastRenderedToolBatches;
   }
 
-  return lastRenderedProcessGroups.length > 0 ? lastRenderedProcessGroups : persistedGroups;
+  const sessionContext = safeSessionValue(ctx, "buildSessionContext", undefined, "session context read");
+  if (!Array.isArray(sessionContext?.messages)) {
+    return [];
+  }
+  return scanToolBatches(sessionContext.messages).filter((batch) => batch.key !== activeToolBatchKey);
 }
 
-function toggleLatestProcessGroup(ctx, config) {
-  const persistedGroups = getProcessGroupEntriesFromEntries(ctx?.sessionManager?.getEntries?.() ?? []);
-  const groups = getCurrentFoldableProcessGroups(ctx, config);
-  const latest = latestProcessGroup(groups);
-  if (!latest) {
-    const scope = persistedGroups.length > 0 ? "current view" : "this session";
-    ctx?.ui?.notify?.(`No folded process group in ${scope} yet.`, "info");
+function toggleLatestToolBatch(ctx, config) {
+  if (!isToolBatchFoldingEnabled(config)) {
+    safeNotify(ctx, "工具批次折叠当前未启用。", "info");
     return;
   }
 
-  const willShow = expandedProcessGroupId !== latest.groupId;
-  expandedProcessGroupId = willShow ? latest.groupId : null;
-  dbg(`TOGGLE: latest.groupId=${latest.groupId} willShow=${willShow} expandedProcessGroupId=${expandedProcessGroupId} persistedGroups=${persistedGroups.length} groups=${groups.length}`);
-  const rebuilt = requestProcessFoldRerender(ctx);
-  dbg(`TOGGLE: rebuilt=${rebuilt}`);
-  const details = formatProcessCountDetails(latest.counts);
-  ctx?.ui?.notify?.(
-    `Process group ${willShow ? "shown" : "hidden"}: ${latest.counts?.total ?? 0} entries${details ? ` (${details})` : ""}; rerender ${rebuilt ? "rebuild" : "requested"}.`,
+  const batches = getCurrentFoldableToolBatches(ctx);
+  const latest = batches.at(-1);
+  if (!latest) {
+    safeNotify(ctx, "当前视图还没有可折叠的已完成工具批次。", "info");
+    return;
+  }
+
+  const willShow = expandedToolBatchKey !== latest.key;
+  expandedToolBatchKey = willShow ? latest.key : null;
+  const rebuilt = requestToolBatchRerender(ctx);
+  safeNotify(
+    ctx,
+    `工具批次已${willShow ? "展开" : "折叠"}：${formatToolBatchSummary(latest)}；${latest.counts.errors} 个错误；渲染${rebuilt ? "已重建" : "已请求"}。`,
     "info",
   );
 }
@@ -924,136 +694,283 @@ function resolveInteractiveModeModulePath(config) {
   return candidates.find((candidate) => existsSync(candidate));
 }
 
-async function patchAssistantRenderer(ctx, config) {
-  if (!config.patchAssistantRenderer) {
+function restoreAssistantRendererPatch(prototype, expectedOwner) {
+  if (!prototype?.[RENDER_PATCH_SYMBOL]) {
+    return true;
+  }
+
+  const patchData = prototype[RENDER_PATCH_DATA_SYMBOL];
+  if (expectedOwner && patchData?.owner !== expectedOwner) {
+    return false;
+  }
+  if (typeof patchData?.originalUpdateContent !== "function") {
     return false;
   }
 
+  prototype.updateContent = patchData.originalUpdateContent;
+  prototype[RENDER_PATCH_DATA_SYMBOL] = undefined;
+  prototype[RENDER_PATCH_SYMBOL] = false;
+  return true;
+}
+
+function unpatchOwnedAssistantRenderer() {
+  if (!patchedAssistantPrototype) {
+    return true;
+  }
+
+  const patchData = patchedAssistantPrototype[RENDER_PATCH_DATA_SYMBOL];
+  if (patchData?.owner === INSTANCE_ID && patchData.config) {
+    patchData.config = { ...patchData.config, enabled: false };
+  }
+  const restored = restoreAssistantRendererPatch(patchedAssistantPrototype, INSTANCE_ID);
+  if (restored) {
+    patchedAssistantPrototype = undefined;
+  }
+  return restored;
+}
+
+async function patchAssistantRenderer(ctx, config) {
+  const shouldPatch = config.enabled && config.patchInternalRenderers && config.stripCommentaryText;
+
   const modulePath = resolveAssistantMessageModulePath(config);
   if (!modulePath) {
-    ctx?.ui?.setStatus("codex-compact-render", ctx.ui.theme.fg("warning", "Codex render patch: unavailable"));
+    safeSetStatus(
+      ctx,
+      "codex-compact-render",
+      shouldPatch ? themeFg(ctx, "warning", "Codex render patch: unavailable") : undefined,
+    );
     return false;
   }
 
   const mod = await import(pathToFileURL(modulePath).href);
   const prototype = mod.AssistantMessageComponent?.prototype;
-  if (!prototype?.updateContent) {
-    ctx?.ui?.setStatus("codex-compact-render", ctx.ui.theme.fg("warning", "Codex render patch: incompatible"));
+  if (!prototype) {
+    safeSetStatus(
+      ctx,
+      "codex-compact-render",
+      shouldPatch ? themeFg(ctx, "warning", "Codex render patch: incompatible") : undefined,
+    );
     return false;
   }
 
-  if (prototype[RENDER_PATCH_SYMBOL]) {
-    const patchData = prototype[RENDER_PATCH_DATA_SYMBOL];
-    if (patchData?.version === RENDER_PATCH_VERSION) {
-      prototype[RENDER_PATCH_DATA_SYMBOL] = {
-        ...patchData,
-        config,
-      };
-      return true;
+  if (patchedAssistantPrototype && patchedAssistantPrototype !== prototype) {
+    if (!unpatchOwnedAssistantRenderer()) {
+      safeSetStatus(ctx, "codex-compact-render", themeFg(ctx, "warning", "Codex render patch: stale patch cleanup failed"));
+      return false;
     }
+  }
 
-    if (typeof patchData?.originalUpdateContent === "function") {
-      prototype.updateContent = patchData.originalUpdateContent;
+  if (!shouldPatch) {
+    if (prototype[RENDER_PATCH_SYMBOL] && !restoreAssistantRendererPatch(prototype)) {
+      safeSetStatus(ctx, "codex-compact-render", themeFg(ctx, "warning", "Codex render patch: stale patch cleanup failed"));
+      return false;
     }
-    prototype[RENDER_PATCH_SYMBOL] = false;
+    if (patchedAssistantPrototype === prototype) {
+      patchedAssistantPrototype = undefined;
+    }
+    safeSetStatus(ctx, "codex-compact-render", undefined);
+    return false;
+  }
+
+  const currentPatch = prototype[RENDER_PATCH_DATA_SYMBOL];
+  if (
+    prototype[RENDER_PATCH_SYMBOL]
+    && currentPatch?.version === RENDER_PATCH_VERSION
+    && currentPatch?.owner === INSTANCE_ID
+  ) {
+    currentPatch.config = config;
+    patchedAssistantPrototype = prototype;
+    safeSetStatus(ctx, "codex-compact-render", undefined);
+    return true;
+  }
+
+  if (prototype[RENDER_PATCH_SYMBOL] && !restoreAssistantRendererPatch(prototype)) {
+    safeSetStatus(ctx, "codex-compact-render", themeFg(ctx, "warning", "Codex render patch: existing patch is incompatible"));
+    return false;
+  }
+  if (typeof prototype.updateContent !== "function") {
+    safeSetStatus(ctx, "codex-compact-render", themeFg(ctx, "warning", "Codex render patch: incompatible"));
+    return false;
   }
 
   const originalUpdateContent = prototype.updateContent;
-  prototype[RENDER_PATCH_DATA_SYMBOL] = { version: RENDER_PATCH_VERSION, originalUpdateContent, config };
+  prototype[RENDER_PATCH_DATA_SYMBOL] = {
+    version: RENDER_PATCH_VERSION,
+    owner: INSTANCE_ID,
+    originalUpdateContent,
+    config,
+  };
   prototype.updateContent = function patchedUpdateContent(message) {
     const patchData = prototype[RENDER_PATCH_DATA_SYMBOL];
-    const renderMessage = patchData?.config?.enabled && patchData?.config?.patchAssistantRenderer && patchData?.config?.stripCommentaryText
+    const renderMessage = patchData?.config?.enabled
+      && patchData.config.patchInternalRenderers
+      && patchData.config.stripCommentaryText
       ? prepareMessageForRendering(message, patchData.config)
       : message;
     return patchData.originalUpdateContent.call(this, renderMessage);
   };
   prototype[RENDER_PATCH_SYMBOL] = true;
+  patchedAssistantPrototype = prototype;
+  safeSetStatus(ctx, "codex-compact-render", undefined);
   return true;
 }
 
-async function syncAssistantRendererPatchConfig(config) {
-  const modulePath = resolveAssistantMessageModulePath(config);
-  if (!modulePath) {
-    return;
+function restoreInteractiveModePatch(prototype, expectedOwner) {
+  if (!prototype?.[INTERACTIVE_PATCH_SYMBOL]) {
+    return true;
   }
 
-  const mod = await import(pathToFileURL(modulePath).href);
-  const prototype = mod.AssistantMessageComponent?.prototype;
-  if (prototype?.[RENDER_PATCH_SYMBOL] && prototype[RENDER_PATCH_DATA_SYMBOL]) {
-    prototype[RENDER_PATCH_DATA_SYMBOL] = {
-      ...prototype[RENDER_PATCH_DATA_SYMBOL],
-      config,
-    };
-  }
-}
-
-async function patchInteractiveModeRenderer(ctx, config) {
-  if (!config.patchAssistantRenderer || !config.foldCompletedTurnProcess) {
+  const patchData = prototype[INTERACTIVE_PATCH_DATA_SYMBOL];
+  if (expectedOwner && patchData?.owner !== expectedOwner) {
     return false;
   }
 
+  const hasRenderer = typeof patchData?.originalRenderSessionItems === "function"
+    || typeof patchData?.originalRenderSessionContext === "function";
+  if (
+    !hasRenderer
+    || typeof patchData?.originalHandleEvent !== "function"
+    || typeof patchData?.originalCreateExtensionUIContext !== "function"
+    || typeof patchData?.originalAddExtensionTerminalInputListener !== "function"
+  ) {
+    return false;
+  }
+
+  if (typeof patchData.originalRenderSessionItems === "function") {
+    prototype.renderSessionItems = patchData.originalRenderSessionItems;
+  }
+  if (typeof patchData.originalRenderSessionContext === "function") {
+    prototype.renderSessionContext = patchData.originalRenderSessionContext;
+  }
+  prototype.handleEvent = patchData.originalHandleEvent;
+  prototype.createExtensionUIContext = patchData.originalCreateExtensionUIContext;
+  prototype.addExtensionTerminalInputListener = patchData.originalAddExtensionTerminalInputListener;
+  prototype[INTERACTIVE_PATCH_DATA_SYMBOL] = undefined;
+  prototype[INTERACTIVE_PATCH_SYMBOL] = false;
+  return true;
+}
+
+function unpatchOwnedInteractiveMode() {
+  if (!patchedInteractivePrototype) {
+    return true;
+  }
+
+  const patchData = patchedInteractivePrototype[INTERACTIVE_PATCH_DATA_SYMBOL];
+  if (patchData?.owner === INSTANCE_ID && patchData.config) {
+    patchData.config = { ...patchData.config, enabled: false };
+  }
+  const restored = restoreInteractiveModePatch(patchedInteractivePrototype, INSTANCE_ID);
+  if (restored) {
+    patchedInteractivePrototype = undefined;
+  }
+  return restored;
+}
+
+async function patchInteractiveModeRenderer(ctx, config) {
+  const shouldPatch = isToolBatchFoldingEnabled(config);
+
   const modulePath = resolveInteractiveModeModulePath(config);
   if (!modulePath) {
-    ctx?.ui?.setStatus?.("codex-compact-fold", ctx.ui.theme.fg("warning", "Codex fold patch: unavailable"));
+    safeSetStatus(
+      ctx,
+      "codex-compact-fold",
+      shouldPatch ? themeFg(ctx, "warning", "Codex tool-batch patch: unavailable") : undefined,
+    );
     return false;
   }
 
   const mod = await import(pathToFileURL(modulePath).href);
   const prototype = mod.InteractiveMode?.prototype;
-  if (!prototype?.renderSessionContext || !prototype?.handleEvent || !prototype?.createExtensionUIContext || !prototype?.addExtensionTerminalInputListener) {
-    ctx?.ui?.setStatus?.("codex-compact-fold", ctx.ui.theme.fg("warning", "Codex fold patch: incompatible"));
+  if (!prototype) {
+    safeSetStatus(
+      ctx,
+      "codex-compact-fold",
+      shouldPatch ? themeFg(ctx, "warning", "Codex tool-batch patch: incompatible") : undefined,
+    );
     return false;
   }
 
-  if (prototype[INTERACTIVE_PATCH_SYMBOL]) {
-    const patchData = prototype[INTERACTIVE_PATCH_DATA_SYMBOL];
-    // index.cjs cache-busts index.js on every /reload. Reuse the original
-    // methods, but always install fresh closures so fold state and shortcuts
-    // come from the same module instance.
-    if (typeof patchData?.originalRenderSessionContext === "function") {
-      prototype.renderSessionContext = patchData.originalRenderSessionContext;
+  if (patchedInteractivePrototype && patchedInteractivePrototype !== prototype) {
+    if (!unpatchOwnedInteractiveMode()) {
+      safeSetStatus(ctx, "codex-compact-fold", themeFg(ctx, "warning", "Codex tool-batch patch: stale patch cleanup failed"));
+      return false;
     }
-    if (typeof patchData?.originalHandleEvent === "function") {
-      prototype.handleEvent = patchData.originalHandleEvent;
-    }
-    if (typeof patchData?.originalCreateExtensionUIContext === "function") {
-      prototype.createExtensionUIContext = patchData.originalCreateExtensionUIContext;
-    }
-    if (typeof patchData?.originalAddExtensionTerminalInputListener === "function") {
-      prototype.addExtensionTerminalInputListener = patchData.originalAddExtensionTerminalInputListener;
-    }
-    prototype[INTERACTIVE_PATCH_SYMBOL] = false;
   }
 
-  const originalRenderSessionContext = prototype.renderSessionContext;
+  if (!shouldPatch) {
+    if (prototype[INTERACTIVE_PATCH_SYMBOL] && !restoreInteractiveModePatch(prototype)) {
+      safeSetStatus(ctx, "codex-compact-fold", themeFg(ctx, "warning", "Codex tool-batch patch: stale patch cleanup failed"));
+      return false;
+    }
+    if (patchedInteractivePrototype === prototype) {
+      patchedInteractivePrototype = undefined;
+    }
+    safeSetStatus(ctx, "codex-compact-fold", undefined);
+    return false;
+  }
+
+  const currentPatch = prototype[INTERACTIVE_PATCH_DATA_SYMBOL];
+  if (
+    prototype[INTERACTIVE_PATCH_SYMBOL]
+    && currentPatch?.version === INTERACTIVE_PATCH_VERSION
+    && currentPatch?.owner === INSTANCE_ID
+  ) {
+    currentPatch.config = config;
+    patchedInteractivePrototype = prototype;
+    safeSetStatus(ctx, "codex-compact-fold", undefined);
+    return true;
+  }
+
+  if (prototype[INTERACTIVE_PATCH_SYMBOL] && !restoreInteractiveModePatch(prototype)) {
+    safeSetStatus(ctx, "codex-compact-fold", themeFg(ctx, "warning", "Codex tool-batch patch: existing patch is incompatible"));
+    return false;
+  }
+
+  if (
+    typeof prototype.renderSessionItems !== "function"
+    || typeof prototype.handleEvent !== "function"
+    || typeof prototype.createExtensionUIContext !== "function"
+    || typeof prototype.addExtensionTerminalInputListener !== "function"
+    || typeof prototype.rebuildChatFromMessages !== "function"
+  ) {
+    safeSetStatus(ctx, "codex-compact-fold", themeFg(ctx, "warning", "Codex tool-batch patch: incompatible"));
+    return false;
+  }
+
+  const originalRenderSessionItems = prototype.renderSessionItems;
   const originalHandleEvent = prototype.handleEvent;
   const originalCreateExtensionUIContext = prototype.createExtensionUIContext;
   const originalAddExtensionTerminalInputListener = prototype.addExtensionTerminalInputListener;
   prototype[INTERACTIVE_PATCH_DATA_SYMBOL] = {
     version: INTERACTIVE_PATCH_VERSION,
-    originalRenderSessionContext,
+    owner: INSTANCE_ID,
+    adapter: "renderSessionItems",
+    originalRenderSessionItems,
     originalHandleEvent,
     originalCreateExtensionUIContext,
     originalAddExtensionTerminalInputListener,
     config,
   };
 
-  prototype.renderSessionContext = function patchedRenderSessionContext(sessionContext, options) {
+  prototype.renderSessionItems = function patchedRenderSessionItems(items, options) {
     lastInteractiveModeInstance = this;
     const patchData = prototype[INTERACTIVE_PATCH_DATA_SYMBOL];
-    const entries = this.sessionManager?.getEntries?.() ?? [];
-    const renderContext = patchData?.config?.enabled && patchData?.config?.foldCompletedTurnProcess
-      ? prepareSessionContextForProcessFolding(sessionContext, entries, patchData.config)
-      : sessionContext;
-    return patchData.originalRenderSessionContext.call(this, renderContext, options);
+    const renderItems = patchData?.config?.enabled && patchData.config.foldCompletedToolBatches
+      ? prepareItemsForToolBatchFolding(items, patchData.config)
+      : items;
+    return patchData.originalRenderSessionItems.call(this, renderItems, options);
   };
 
   prototype.handleEvent = async function patchedHandleEvent(event) {
     lastInteractiveModeInstance = this;
     const patchData = prototype[INTERACTIVE_PATCH_DATA_SYMBOL];
     const result = await patchData.originalHandleEvent.call(this, event);
-    if (event?.type === "agent_end" && patchData?.config?.enabled && patchData?.config?.foldCompletedTurnProcess) {
-      this.rebuildChatFromMessages?.();
+    if (patchData?.config?.enabled && patchData.config.foldCompletedToolBatches && isCompleteToolBatchEvent(event)) {
+      try {
+        this.rebuildChatFromMessages?.();
+      } catch (error) {
+        warnCompactUiFailure("turn_end rebuild", error);
+      }
     }
     return result;
   };
@@ -1077,22 +994,67 @@ async function patchInteractiveModeRenderer(ctx, config) {
   };
 
   prototype[INTERACTIVE_PATCH_SYMBOL] = true;
+  patchedInteractivePrototype = prototype;
+  safeSetStatus(ctx, "codex-compact-fold", undefined);
   return true;
 }
+function safeUiCall(ctx, method, ...args) {
+  try {
+    const fn = ctx?.ui?.[method];
+    if (typeof fn !== "function") {
+      return false;
+    }
+    fn.apply(ctx.ui, args);
+    return true;
+  } catch (error) {
+    warnCompactUiFailure(`${method} UI call`, error);
+    return false;
+  }
+}
 
-async function syncInteractiveModePatchConfig(config) {
-  const modulePath = resolveInteractiveModeModulePath(config);
-  if (!modulePath) {
+function safeUiValue(ctx, method, fallback) {
+  try {
+    const fn = ctx?.ui?.[method];
+    return typeof fn === "function" ? fn.call(ctx.ui) : fallback;
+  } catch (error) {
+    warnCompactUiFailure(`${method} UI read`, error);
+    return fallback;
+  }
+}
+
+function safeNotify(ctx, message, level = "info") {
+  if (safeUiCall(ctx, "notify", message, level)) {
     return;
   }
+  console.log(message);
+}
 
-  const mod = await import(pathToFileURL(modulePath).href);
-  const prototype = mod.InteractiveMode?.prototype;
-  if (prototype?.[INTERACTIVE_PATCH_SYMBOL] && prototype[INTERACTIVE_PATCH_DATA_SYMBOL]) {
-    prototype[INTERACTIVE_PATCH_DATA_SYMBOL] = {
-      ...prototype[INTERACTIVE_PATCH_DATA_SYMBOL],
-      config,
-    };
+function safeSetStatus(ctx, key, value) {
+  safeUiCall(ctx, "setStatus", key, value);
+}
+
+function themeFg(ctx, tone, text) {
+  try {
+    return ctx?.ui?.theme?.fg?.(tone, text) ?? text;
+  } catch {
+    return text;
+  }
+}
+
+function safeSetWidget(ctx, key, lines, options) {
+  return safeUiCall(ctx, "setWidget", key, lines, options);
+}
+
+function safeOnTerminalInput(ctx, handler) {
+  try {
+    const fn = ctx?.ui?.["onTerminalInput"];
+    if (typeof fn !== "function") {
+      return undefined;
+    }
+    return fn.call(ctx.ui, handler);
+  } catch (error) {
+    warnCompactUiFailure("terminal input registration", error);
+    return undefined;
   }
 }
 
@@ -1101,66 +1063,108 @@ function applyUiConfig(ctx, config) {
     return;
   }
 
-  ctx.ui.setHiddenThinkingLabel(config.hiddenThinkingLabel);
-  ctx.ui.setToolsExpanded(!config.collapseToolOutput);
-  ctx.ui.setWorkingMessage(config.workingMessage);
+  if (!toolsExpandedCaptured) {
+    toolsExpandedBeforeEnable = safeUiValue(ctx, "getToolsExpanded", undefined);
+    toolsExpandedCaptured = typeof toolsExpandedBeforeEnable === "boolean";
+  }
+
+  safeUiCall(ctx, "setHiddenThinkingLabel", config.hiddenThinkingLabel);
+  safeUiCall(ctx, "setToolsExpanded", !config.collapseToolOutput);
+  safeUiCall(ctx, "setWorkingMessage", config.workingMessage);
 
   if (config.hideWorkingRow) {
-    ctx.ui.setWorkingVisible(false);
-    ctx.ui.setWorkingIndicator({ frames: [] });
+    safeUiCall(ctx, "setWorkingVisible", false);
+    safeUiCall(ctx, "setWorkingIndicator", { frames: [] });
   } else {
-    ctx.ui.setWorkingVisible(true);
+    safeUiCall(ctx, "setWorkingVisible", true);
+    safeUiCall(ctx, "setWorkingIndicator");
   }
 }
 
+function resetUiConfig(ctx) {
+  safeUiCall(ctx, "setHiddenThinkingLabel");
+  if (toolsExpandedCaptured) {
+    safeUiCall(ctx, "setToolsExpanded", toolsExpandedBeforeEnable);
+  }
+  toolsExpandedBeforeEnable = undefined;
+  toolsExpandedCaptured = false;
+  safeUiCall(ctx, "setWorkingMessage");
+  safeUiCall(ctx, "setWorkingVisible", true);
+  safeUiCall(ctx, "setWorkingIndicator");
+  safeSetStatus(ctx, "codex-compact", undefined);
+  safeSetStatus(ctx, "codex-compact-render", undefined);
+  safeSetStatus(ctx, "codex-compact-fold", undefined);
+}
+
 async function enableCompactRuntime(ctx, config) {
+  if (ctx?.mode !== "tui") {
+    safeSetStatus(
+      ctx,
+      "codex-compact",
+      config.enabled ? themeFg(ctx, "dim", "Codex compact: on; TUI patches skipped outside interactive mode") : undefined,
+    );
+    return;
+  }
+
+  if (!config.enabled) {
+    try {
+      await patchAssistantRenderer(ctx, config);
+      await patchInteractiveModeRenderer(ctx, config);
+    } catch (error) {
+      warnCompactUiFailure("disabled runtime cleanup", error);
+    }
+    disableCompactRuntime(ctx);
+    return;
+  }
+
+  if (!config.foldCompletedToolBatches) {
+    resetToolBatchFoldState();
+  }
   applyUiConfig(ctx, config);
   if (config.loadError) {
-    ctx.ui.notify(`Codex compact config load failed, using defaults: ${config.loadError}`, "warning");
+    safeNotify(ctx, `Codex compact config load failed, using defaults: ${config.loadError}`, "warning");
   }
 
   try {
     const patched = await patchAssistantRenderer(ctx, config);
     const foldPatched = await patchInteractiveModeRenderer(ctx, config);
-    registerProcessFoldTerminalInput(ctx, config);
-    ctx.ui.setStatus(
+    registerToolBatchTerminalInput(ctx, config);
+    safeSetStatus(
+      ctx,
       "codex-compact",
-      ctx.ui.theme.fg("dim", `Codex compact: on${patched ? " + render patch" : ""}${foldPatched ? " + fold patch" : ""}`),
+      themeFg(ctx, "dim", `Codex compact: on${patched ? " + render patch" : ""}${foldPatched ? " + fold patch" : ""}`),
     );
   } catch (error) {
-    ctx.ui.setStatus("codex-compact", ctx.ui.theme.fg("warning", "Codex compact: on; render patch failed"));
-    ctx.ui.notify(`Codex compact render patch failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    safeSetStatus(ctx, "codex-compact", themeFg(ctx, "warning", "Codex compact: on; render patch failed"));
+    safeNotify(ctx, `Codex compact render patch failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
   }
 }
 
-async function disableCompactRuntime(ctx, config) {
+function disableCompactRuntime(ctx) {
   closeHiddenCommentarySummary(ctx);
-  expandedProcessGroupId = null;
-  unregisterProcessFoldTerminalInput();
-  await syncAssistantRendererPatchConfig(config);
-  await syncInteractiveModePatchConfig(config);
-  requestProcessFoldRerender(ctx);
-  ctx.ui.setHiddenThinkingLabel();
-  ctx.ui.setWorkingMessage();
-  ctx.ui.setWorkingVisible(true);
-  ctx.ui.setWorkingIndicator();
-  ctx.ui.setStatus("codex-compact", undefined);
+  resetToolBatchFoldState();
+  unregisterToolBatchTerminalInput();
+  unpatchOwnedAssistantRenderer();
+  unpatchOwnedInteractiveMode();
+  requestToolBatchRerender(ctx);
+  resetUiConfig(ctx);
+  lastInteractiveModeInstance = undefined;
 }
 
 function getAuditEntries(ctx) {
-  return ctx.sessionManager
-    .getEntries()
+  return safeSessionEntries(ctx)
     .filter((entry) => entry.type === "custom" && entry.customType === AUDIT_ENTRY_TYPE);
 }
 
 let hiddenSummaryWidgetVisible = false;
 
 function resetEphemeralRuntimeState() {
-  expandedProcessGroupId = null;
+  resetToolBatchFoldState();
   lastInteractiveModeInstance = undefined;
-  lastRenderedProcessGroups = [];
   hiddenSummaryWidgetVisible = false;
-  unregisterProcessFoldTerminalInput();
+  toolsExpandedBeforeEnable = undefined;
+  toolsExpandedCaptured = false;
+  unregisterToolBatchTerminalInput();
 }
 
 function getHiddenSummaryWidgetLines(summary, config) {
@@ -1172,24 +1176,22 @@ function getHiddenSummaryWidgetLines(summary, config) {
 }
 
 function closeHiddenCommentarySummary(ctx) {
-  if (typeof ctx?.ui?.setWidget !== "function") {
-    return false;
+  if (safeSetWidget(ctx, HIDDEN_SUMMARY_WIDGET_KEY, undefined)) {
+    hiddenSummaryWidgetVisible = false;
+    return true;
   }
 
-  ctx.ui.setWidget(HIDDEN_SUMMARY_WIDGET_KEY, undefined);
-  hiddenSummaryWidgetVisible = false;
-  return true;
+  return false;
 }
 
 function showLatestHiddenCommentarySummary(ctx, config) {
   const summary = formatLatestHiddenCommentarySummary(getAuditEntries(ctx));
-  if (typeof ctx?.ui?.setWidget === "function") {
-    ctx.ui.setWidget(HIDDEN_SUMMARY_WIDGET_KEY, getHiddenSummaryWidgetLines(summary, config), { placement: "aboveEditor" });
+  if (safeSetWidget(ctx, HIDDEN_SUMMARY_WIDGET_KEY, getHiddenSummaryWidgetLines(summary, config), { placement: "aboveEditor" })) {
     hiddenSummaryWidgetVisible = true;
     return;
   }
 
-  ctx.ui.notify(summary, "info");
+  safeNotify(ctx, summary, "info");
 }
 
 function toggleLatestHiddenCommentarySummary(ctx, config) {
@@ -1276,14 +1278,12 @@ function formatConfigSummary(config) {
   return (
     `Codex compact: ${config.enabled ? "on" : "off"}; ` +
     `strip commentary: ${config.stripCommentaryText ? "on" : "off"}; ` +
-    `turn folding: ${config.foldCompletedTurnProcess ? "on" : "off"}; ` +
-    `unsigned final fallback: ${config.foldUnsignedFinalSections ? "on" : "off"}; ` +
-    `render-derived folds: ${config.deriveFoldGroupsOnRender ? "on" : "off"}; ` +
+    `tool batch folding: ${config.foldCompletedToolBatches ? "on" : "off"}; ` +
     `audit: ${config.auditHiddenCommentary ? "on" : "off"}; ` +
-    `render patch: ${config.patchAssistantRenderer ? "on" : "off"}; ` +
+    `internal renderer patches: ${config.patchInternalRenderers ? "on" : "off"}; ` +
     `marker: ${config.showHiddenCommentaryMarker ? "on" : "off"}; ` +
     `summary shortcut: ${config.hiddenSummaryShortcut || "off"}; ` +
-    `process shortcut: ${config.turnProcessFoldShortcut || "off"}; ` +
+    `tool batch shortcut: ${config.toolBatchFoldShortcut || "off"}; ` +
     `tools: ${config.collapseToolOutput ? "collapsed" : "expanded"}; ` +
     `config: ${CONFIG_PATH}`
   );
@@ -1297,20 +1297,18 @@ async function formatDoctorReport(config) {
     `Config load: ${config.loadError ? `failed; using defaults (${config.loadError})` : "ok"}`,
     `Extension enabled: ${config.enabled ? "yes" : "no"}`,
     `Finalized message filter: ${config.stripCommentaryText ? "enabled" : "disabled"}`,
-    `Turn process folding: ${config.foldCompletedTurnProcess ? "enabled" : "disabled"}`,
-    `Unsigned final-section fallback: ${config.foldUnsignedFinalSections ? "enabled" : "disabled"}`,
-    `Render-derived fold groups: ${config.deriveFoldGroupsOnRender ? "enabled" : "disabled"}`,
+    `Completed tool-batch folding: ${config.foldCompletedToolBatches ? "enabled" : "disabled"}`,
     `Audit entries: ${config.auditHiddenCommentary ? "enabled" : "disabled"}`,
-    `Renderer patch configured: ${config.patchAssistantRenderer ? "enabled" : "disabled"}`,
+    `Internal renderer patches: ${config.patchInternalRenderers ? "enabled" : "disabled"}`,
     `Hidden commentary marker: ${config.showHiddenCommentaryMarker ? "enabled" : "disabled"}`,
     `Hidden summary shortcut: ${config.hiddenSummaryShortcut || "disabled"}`,
-    `Turn process shortcut: ${config.turnProcessFoldShortcut || "disabled"}`,
+    `Tool-batch shortcut: ${config.toolBatchFoldShortcut || "disabled"}`,
   ];
 
   const modulePath = resolveAssistantMessageModulePath(config);
   lines.push(`Assistant renderer module: ${modulePath ?? "not found"}`);
 
-  if (!config.patchAssistantRenderer) {
+  if (!config.patchInternalRenderers) {
     lines.push("Renderer patch check: skipped; disabled by config");
   } else if (!modulePath) {
     lines.push("Renderer patch check: failed; assistant renderer module was not found");
@@ -1330,30 +1328,35 @@ async function formatDoctorReport(config) {
 
   const interactivePath = resolveInteractiveModeModulePath(config);
   lines.push(`Interactive mode module: ${interactivePath ?? "not found"}`);
-  if (!config.patchAssistantRenderer || !config.foldCompletedTurnProcess) {
-    lines.push("Turn fold patch check: skipped; disabled by config");
+  if (!config.patchInternalRenderers || !config.foldCompletedToolBatches) {
+    lines.push("Tool-batch fold patch check: skipped; disabled by config");
     return lines.join("\n");
   }
   if (!interactivePath) {
-    lines.push("Turn fold patch check: failed; interactive mode module was not found");
+    lines.push("Tool-batch fold patch check: failed; interactive mode module was not found");
     return lines.join("\n");
   }
   try {
     const mod = await import(pathToFileURL(interactivePath).href);
     const prototype = mod.InteractiveMode?.prototype;
-    const compatible = typeof prototype?.renderSessionContext === "function"
+    const compatible = typeof prototype?.renderSessionItems === "function"
       && typeof prototype?.handleEvent === "function"
       && typeof prototype?.createExtensionUIContext === "function"
-      && typeof prototype?.addExtensionTerminalInputListener === "function";
-    lines.push(`InteractiveMode.renderSessionContext: ${typeof prototype?.renderSessionContext === "function" ? "found" : "missing"}`);
+      && typeof prototype?.addExtensionTerminalInputListener === "function"
+      && typeof prototype?.rebuildChatFromMessages === "function";
+    lines.push(`Interactive adapter: ${compatible ? "renderSessionItems" : "none"}`);
+    lines.push(`InteractiveMode.renderSessionItems: ${typeof prototype?.renderSessionItems === "function" ? "found" : "missing"}`);
+    lines.push(`InteractiveMode.renderSessionContext: ${typeof prototype?.renderSessionContext === "function" ? "found (unused)" : "missing (expected on Pi 0.80.6)"}`);
     lines.push(`InteractiveMode.handleEvent: ${typeof prototype?.handleEvent === "function" ? "found" : "missing"}`);
     lines.push(`InteractiveMode.createExtensionUIContext: ${typeof prototype?.createExtensionUIContext === "function" ? "found" : "missing"}`);
     lines.push(`InteractiveMode.addExtensionTerminalInputListener: ${typeof prototype?.addExtensionTerminalInputListener === "function" ? "found" : "missing"}`);
-    lines.push(`Turn fold currently patched: ${prototype?.[INTERACTIVE_PATCH_SYMBOL] ? "yes" : "no"}`);
-    lines.push(`Turn fold patch version: ${prototype?.[INTERACTIVE_PATCH_DATA_SYMBOL]?.version ?? "legacy/unknown"}`);
-    lines.push(`Turn fold patch check: ${compatible ? "compatible" : "incompatible"}`);
+    lines.push(`InteractiveMode.rebuildChatFromMessages: ${typeof prototype?.rebuildChatFromMessages === "function" ? "found" : "missing"}`);
+    lines.push(`Tool-batch fold currently patched: ${prototype?.[INTERACTIVE_PATCH_SYMBOL] ? "yes" : "no"}`);
+    lines.push(`Tool-batch fold patch version: ${prototype?.[INTERACTIVE_PATCH_DATA_SYMBOL]?.version ?? "legacy/unknown"}`);
+    lines.push(`Tool-batch fold patch adapter: ${prototype?.[INTERACTIVE_PATCH_DATA_SYMBOL]?.adapter ?? "none"}`);
+    lines.push(`Tool-batch fold patch check: ${compatible ? "compatible" : "incompatible"}`);
   } catch (error) {
-    lines.push(`Turn fold patch check: import failed (${error instanceof Error ? error.message : String(error)})`);
+    lines.push(`Tool-batch fold patch check: import failed (${error instanceof Error ? error.message : String(error)})`);
   }
 
   return lines.join("\n");
@@ -1368,24 +1371,22 @@ export default function piCodexCompact(pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     resetEphemeralRuntimeState();
-    if (!config.enabled) {
-      return;
-    }
     await enableCompactRuntime(ctx, config);
   });
 
-  pi.on("agent_end", (event, ctx) => {
-    if (!config.enabled || !config.foldCompletedTurnProcess) {
+  pi.on("turn_end", (event) => {
+    if (!isToolBatchFoldingEnabled(config)) {
       return;
     }
 
-    const processGroup = buildProcessGroupEntry(event, ctx, config);
-    if (!processGroup || hasProcessGroupForFinal(ctx, processGroup)) {
+    const batch = isCompleteToolBatchEvent(event);
+    if (!batch) {
       return;
     }
-
-    expandedProcessGroupId = null;
-    pi.appendEntry(PROCESS_GROUP_ENTRY_TYPE, processGroup);
+    if (activeToolBatchKey === batch.key) {
+      activeToolBatchKey = null;
+    }
+    expandedToolBatchKey = null;
   });
 
   pi.on("input", (event, ctx) => {
@@ -1394,11 +1395,18 @@ export default function piCodexCompact(pi) {
       return { action: "continue" };
     }
 
-    toggleLatestProcessGroup(ctx, config);
+    toggleLatestToolBatch(ctx, config);
     return { action: "handled" };
   });
 
   pi.on("message_end", (event, ctx) => {
+    if (isToolBatchFoldingEnabled(config)) {
+      const batch = inspectToolBatch(event.message, []);
+      if (batch?.valid) {
+        activeToolBatchKey = batch.key;
+      }
+    }
+
     if (!config.enabled || !config.stripCommentaryText) {
       return;
     }
@@ -1410,27 +1418,29 @@ export default function piCodexCompact(pi) {
         pi.appendEntry(AUDIT_ENTRY_TYPE, buildHiddenCommentaryAuditEntry(event.message, hiddenBlocks, config));
       }
       if (config.showHiddenCommentaryMarker && hiddenBlocks.length > 0) {
-        ctx?.ui?.notify(formatHiddenCommentaryMarker(hiddenBlocks.length, config), "info");
+        safeNotify(ctx, formatHiddenCommentaryMarker(hiddenBlocks.length, config), "info");
       }
       return { message };
     }
   });
 
-  if (config.turnProcessFoldShortcut) {
-    pi.registerShortcut(config.turnProcessFoldShortcut, {
-      description: "Show or hide the latest folded turn process in place",
-      handler: (ctx) => toggleLatestProcessGroup(ctx, config),
+  if (config.toolBatchFoldShortcut) {
+    pi.registerShortcut(config.toolBatchFoldShortcut, {
+      description: "展开或折叠最近一个已完成工具批次",
+      handler: (ctx) => toggleLatestToolBatch(ctx, config),
     });
   }
 
-  if (config.hiddenSummaryShortcut && config.hiddenSummaryShortcut !== config.turnProcessFoldShortcut) {
+  if (config.hiddenSummaryShortcut && config.hiddenSummaryShortcut !== config.toolBatchFoldShortcut) {
     pi.registerShortcut(config.hiddenSummaryShortcut, {
       description: "Show latest hidden commentary metadata without revealing hidden text",
       handler: (ctx) => toggleLatestHiddenCommentarySummary(ctx, config),
     });
   }
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", (_event, ctx) => {
+    disableCompactRuntime(ctx);
+    resetEphemeralRuntimeState();
     if (state[REGISTRATION_KEY] === INSTANCE_ID) {
       delete state[REGISTRATION_KEY];
     }
@@ -1438,57 +1448,60 @@ export default function piCodexCompact(pi) {
 
   pi.registerCommand("codex-compact", {
     description: "Show, reload, or toggle Codex-style compact display settings.",
-    handler: async (args, ctx) => {
-      const subcommand = args.trim().toLowerCase();
+    handler: async (args = "", ctx) => {
+      try {
+        const subcommand = String(args ?? "").trim().toLowerCase();
 
-      if (subcommand === "audit") {
-        ctx.ui.notify(formatAuditSummary(getAuditEntries(ctx)), "info");
-        return;
-      }
-
-      if (subcommand === "latest" || subcommand === "summary") {
-        showLatestHiddenCommentarySummary(ctx, config);
-        return;
-      }
-
-      if (subcommand === "doctor") {
-        ctx.ui.notify(await formatDoctorReport(config), "info");
-        return;
-      }
-
-      if (subcommand === "reload") {
-        config = loadConfig();
-        if (config.enabled) {
-          await enableCompactRuntime(ctx, config);
-        } else {
-          await disableCompactRuntime(ctx, config);
+        if (subcommand === "audit") {
+          safeNotify(ctx, formatAuditSummary(getAuditEntries(ctx)), "info");
+          return;
         }
-        ctx.ui.notify(`Codex compact config reloaded. ${formatConfigSummary(config)}`, "info");
-        return;
-      }
 
-      if (subcommand === "toggle" || subcommand === "fold") {
-        toggleLatestProcessGroup(ctx, config);
-        return;
-      }
+        if (subcommand === "latest" || subcommand === "summary") {
+          showLatestHiddenCommentarySummary(ctx, config);
+          return;
+        }
 
-      if (!subcommand || subcommand === "show") {
-        ctx.ui.notify(formatConfigSummary(config), "info");
-        return;
-      }
+        if (subcommand === "doctor") {
+          safeNotify(ctx, await formatDoctorReport(config), "info");
+          return;
+        }
 
-      if (subcommand !== "on" && subcommand !== "off") {
-        ctx.ui.notify("Usage: /codex-compact [show|audit|latest|summary|doctor|reload|toggle|fold|on|off]", "error");
-        return;
-      }
+        if (subcommand === "reload") {
+          const previousToolShortcut = config.toolBatchFoldShortcut;
+          const previousSummaryShortcut = config.hiddenSummaryShortcut;
+          config = loadConfig();
+          const shortcutChanged = previousToolShortcut !== config.toolBatchFoldShortcut
+            || previousSummaryShortcut !== config.hiddenSummaryShortcut;
+          await enableCompactRuntime(ctx, config);
+          const shortcutNotice = shortcutChanged
+            ? " Shortcut registration changed; run Pi /reload to remove old bindings and activate all new bindings."
+            : "";
+          safeNotify(ctx, `Codex compact config reloaded. ${formatConfigSummary(config)}${shortcutNotice}`, "info");
+          return;
+        }
 
-      config = { ...config, enabled: subcommand === "on" };
-      if (config.enabled) {
+        if (subcommand === "toggle" || subcommand === "fold") {
+          toggleLatestToolBatch(ctx, config);
+          return;
+        }
+
+        if (!subcommand || subcommand === "show") {
+          safeNotify(ctx, formatConfigSummary(config), "info");
+          return;
+        }
+
+        if (subcommand !== "on" && subcommand !== "off") {
+          safeNotify(ctx, "Usage: /codex-compact [show|audit|latest|summary|doctor|reload|toggle|fold|on|off]", "error");
+          return;
+        }
+
+        config = { ...config, enabled: subcommand === "on" };
         await enableCompactRuntime(ctx, config);
-      } else {
-        await disableCompactRuntime(ctx, config);
+        safeNotify(ctx, `Codex compact ${config.enabled ? "enabled" : "disabled"}`, "info");
+      } catch (error) {
+        safeNotify(ctx, `Codex compact command failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
-      ctx.ui.notify(`Codex compact ${config.enabled ? "enabled" : "disabled"}`, "info");
     },
   });
 }
