@@ -193,6 +193,12 @@ function toolCallCount(items) {
     : 0), 0);
 }
 
+function thinkingBlockCount(items) {
+  return items.reduce((total, item) => total + (item?.role === "assistant" && Array.isArray(item.content)
+    ? item.content.filter((block) => block.type === "thinking").length
+    : 0), 0);
+}
+
 function createInteractiveRendererHarness(InteractiveMode, sessionManager, ui, getItems) {
   const chatContainer = {
     children: [],
@@ -330,16 +336,17 @@ async function main() {
     const realPatchData = InteractiveMode.prototype[interactivePatchDataSymbol];
     assert(realPatchData?.originalRenderSessionItems === realRenderSessionItems, "patch did not wrap Pi 0.80.6's real renderSessionItems");
     assert(realPatchData?.adapter === "renderSessionItems", "real installed adapter should be renderSessionItems");
-    assert(realPatchData?.version === 8, "unexpected real interactive patch version");
+    assert(realPatchData?.version === 9, "unexpected real interactive patch version");
     await realAdapterRuntime.commands.get("codex-compact").handler("doctor", realAdapterRuntime.ctx);
     const realDoctor = realAdapterRuntime.notifications.at(-1)?.message ?? "";
     for (const expected of [
       "Completed tool-batch folding: enabled",
+      "Fold unit: narrative-bounded activity segment",
       "Interactive adapter: renderSessionItems",
       "InteractiveMode.renderSessionItems: found",
       "InteractiveMode.renderSessionContext: missing (expected on Pi 0.80.6)",
       "InteractiveMode.rebuildChatFromMessages: found",
-      "Tool-batch fold patch version: 8",
+      "Tool-batch fold patch version: 9",
       "Tool-batch fold patch adapter: renderSessionItems",
       "Tool-batch fold patch check: compatible",
     ]) {
@@ -509,16 +516,17 @@ async function main() {
 
     const patchData = InteractiveMode.prototype[interactivePatchDataSymbol];
     assert(patchData?.adapter === "renderSessionItems", "active adapter should be renderSessionItems");
-    assert(patchData?.version === 8, "unexpected interactive patch version");
+    assert(patchData?.version === 9, "unexpected interactive patch version");
     await runtime.commands.get("codex-compact").handler("doctor", runtime.ctx);
     const doctor = runtime.notifications.at(-1)?.message ?? "";
     for (const expected of [
       "Completed tool-batch folding: enabled",
+      "Fold unit: narrative-bounded activity segment",
       "Interactive adapter: renderSessionItems",
       "InteractiveMode.renderSessionItems: found",
       "InteractiveMode.renderSessionContext: missing (expected on Pi 0.80.6)",
       "InteractiveMode.rebuildChatFromMessages: found",
-      "Tool-batch fold patch version: 8",
+      "Tool-batch fold patch version: 9",
       "Tool-batch fold patch adapter: renderSessionItems",
       "Tool-batch fold patch check: compatible",
     ]) {
@@ -584,12 +592,14 @@ async function main() {
 
     const foldedAssistant = fakeInteractive.renderedItems.find((item) => item.responseId === first.assistant.responseId);
     const preservedBlocks = foldedAssistant.content.filter((block) => block.type !== "text" || !block.text.startsWith("⌕ "));
-    const originalNonToolBlocks = first.assistant.content.filter((block) => block.type !== "toolCall");
-    assertDeepEqual(preservedBlocks, originalNonToolBlocks, "folding changed commentary/thinking/final blocks or metadata");
+    const originalNarrativeBlocks = first.assistant.content.filter((block) => block.type !== "toolCall" && block.type !== "thinking");
+    assertDeepEqual(preservedBlocks, originalNarrativeBlocks, "folding changed narrative blocks or metadata");
+    assert(thinkingBlockCount(fakeInteractive.renderedItems) === 0, "collapsed activity left a Thinking hidden source block");
     assertDeepEqual(runtime.ctx.sessionManager.buildSessionContext().messages, contextBeforeFold, "rendering changed mock LLM context");
 
     await runtime.shortcuts.get("alt+p").handler(runtime.ctx);
     assert(toolCallCount(fakeInteractive.renderedItems) === 5, "Alt+P did not restore calls");
+    assert(thinkingBlockCount(fakeInteractive.renderedItems) === 1, "Alt+P did not restore thinking");
     assert(JSON.stringify(fakeInteractive.renderedItems).includes("batch_one result 2"), "Alt+P did not restore error details");
     assert(JSON.stringify(fakeInteractive.renderedItems).includes("aW1hZ2U="), "Alt+P did not restore image output");
     const restoredErrorRow = fakeInteractive.chatContainer.children.find(
@@ -598,7 +608,7 @@ async function main() {
     assert(restoredErrorRow, "real Pi renderer did not hydrate the restored error result row");
     await runtime.commands.get("codex-compact").handler("toggle", runtime.ctx);
     assert(toolCallCount(fakeInteractive.renderedItems) === 0, "toggle command did not re-fold latest batch");
-    assert(runtime.notifications.some((entry) => entry.message.includes("工具批次已展开")), "toggle did not report expanded state");
+    assert(runtime.notifications.some((entry) => entry.message.includes("工具活动已展开")), "toggle did not report expanded state");
 
     const rawResult = runtime.terminalInputListeners[0]("\x1bp");
     assert(rawResult?.consume === true, "raw Alt+P was not consumed");
@@ -630,6 +640,140 @@ async function main() {
     sessionMessages.push(finalAssistant);
     InteractiveMode.prototype.renderSessionItems.call(fakeInteractive, sessionMessages);
     assert(fakeInteractive.renderedItems.at(-1) === finalAssistant, "later final assistant response should pass through unchanged");
+
+    const segmentFirst = makeBatch("segment_first", 90, ["read"]);
+    segmentFirst.assistant.content = [
+      { type: "thinking", thinking: "segment first thinking", thinkingSignature: "segment-first-thinking" },
+      textMessage("我先核对当前实际配置位置。", "commentary", "segment-description"),
+      ...segmentFirst.calls,
+    ];
+    const segmentSecond = makeBatch("segment_second", 100, ["bash", "edit"], [1]);
+    segmentSecond.assistant.content = [
+      { type: "thinking", thinking: "segment second thinking", thinkingSignature: "segment-second-thinking" },
+      ...segmentSecond.calls,
+    ];
+    const segmentTrailingThinking = {
+      role: "assistant",
+      responseId: "segment_trailing_thinking",
+      timestamp: 110,
+      stopReason: "stop",
+      content: [{ type: "thinking", thinking: "trailing thinking", thinkingSignature: "segment-trailing-thinking" }],
+    };
+    const segmentFinal = {
+      role: "assistant",
+      responseId: "segment_final",
+      timestamp: 120,
+      stopReason: "stop",
+      content: [textMessage("SEGMENT FINAL ANSWER", "final_answer", "segment-final")],
+    };
+    const segmentItems = [user, segmentFirst.assistant];
+    const segmentInteractive = createInteractiveRendererHarness(
+      InteractiveMode,
+      runtime.ctx.sessionManager,
+      runtime.ctx.ui,
+      () => segmentItems,
+    );
+
+    runtime.handlers.get("message_end")({ type: "message_end", message: segmentFirst.assistant }, runtime.ctx);
+    InteractiveMode.prototype.renderSessionItems.call(segmentInteractive, segmentItems);
+    assert(markerTexts(segmentInteractive.renderedItems).length === 0, "active narrative batch received an activity marker");
+    assert(toolCallCount(segmentInteractive.renderedItems) === 1, "active narrative batch did not remain expanded");
+    segmentItems.push(...segmentFirst.results);
+    const segmentFirstTurnEnd = { type: "turn_end", message: segmentFirst.assistant, toolResults: segmentFirst.results };
+    runtime.handlers.get("turn_end")(segmentFirstTurnEnd, runtime.ctx);
+    await InteractiveMode.prototype.handleEvent.call(segmentInteractive, segmentFirstTurnEnd);
+    assert(markerTexts(segmentInteractive.renderedItems).length === 1, "first completed activity batch did not fold at turn_end");
+
+    segmentItems.push(segmentSecond.assistant);
+    runtime.handlers.get("message_end")({ type: "message_end", message: segmentSecond.assistant }, runtime.ctx);
+    InteractiveMode.prototype.renderSessionItems.call(segmentInteractive, segmentItems);
+    assert(markerTexts(segmentInteractive.renderedItems).length === 1, "prior activity segment did not stay folded while the next batch was active");
+    assert(toolCallCount(segmentInteractive.renderedItems) === 2, "active non-narrative batch did not remain expanded");
+    assert(thinkingBlockCount(segmentInteractive.renderedItems) === 1, "active non-narrative thinking should remain visible");
+    segmentItems.push(...segmentSecond.results);
+    const segmentSecondTurnEnd = { type: "turn_end", message: segmentSecond.assistant, toolResults: segmentSecond.results };
+    runtime.handlers.get("turn_end")(segmentSecondTurnEnd, runtime.ctx);
+    await InteractiveMode.prototype.handleEvent.call(segmentInteractive, segmentSecondTurnEnd);
+    assert(segmentInteractive.rebuildCount === 2, "each completed activity batch should trigger exactly one rebuild");
+
+    segmentItems.push(segmentTrailingThinking, segmentFinal);
+    const segmentItemsBeforeRender = structuredClone(segmentItems);
+    InteractiveMode.prototype.renderSessionItems.call(segmentInteractive, segmentItems);
+    assert(markerTexts(segmentInteractive.renderedItems).length === 1, "consecutive non-narrative batches did not merge into one activity marker");
+    assert(toolCallCount(segmentInteractive.renderedItems) === 0, "collapsed activity segment left tool calls visible");
+    assert(thinkingBlockCount(segmentInteractive.renderedItems) === 0, "collapsed activity segment left Thinking hidden source blocks");
+    const segmentChatMessages = segmentInteractive.chatContainer.children
+      .map((child) => child?.renderedMessage)
+      .filter(Boolean);
+    assert(
+      segmentChatMessages.every((message) => !message.content?.some((block) => block.type === "thinking")),
+      "real Pi renderer received a Thinking hidden source block for a collapsed activity segment",
+    );
+    assert(
+      segmentChatMessages.some((message) => message.content?.some((block) => block.text === "我先核对当前实际配置位置。")),
+      "real Pi renderer did not receive the narrative description",
+    );
+    const segmentMarker = markerTexts(segmentInteractive.renderedItems)[0] ?? "";
+    for (const expected of ["已读取 1 个文件", "运行 1 个命令", "修改 1 次", "1 个错误"]) {
+      assert(segmentMarker.includes(expected), `activity segment summary missing: ${expected}`);
+    }
+    const segmentNarrative = segmentInteractive.renderedItems.flatMap((item) => item?.role === "assistant"
+      ? item.content.filter((block) => block.type === "text" && !block.text.startsWith("⌕ "))
+      : []);
+    assertDeepEqual(
+      segmentNarrative,
+      [segmentFirst.assistant.content[1], segmentFinal.content[0]],
+      "activity segment folding changed description/final text or signature metadata",
+    );
+    await runtime.shortcuts.get("alt+p").handler(runtime.ctx);
+    assert(toolCallCount(segmentInteractive.renderedItems) === 3, "Alt+P did not restore the whole activity segment");
+    assert(thinkingBlockCount(segmentInteractive.renderedItems) === 3, "Alt+P did not restore all activity thinking blocks");
+    await runtime.commands.get("codex-compact").handler("toggle", runtime.ctx);
+    assert(markerTexts(segmentInteractive.renderedItems).length === 1, "toggle did not re-fold the merged activity segment");
+    assertDeepEqual(segmentItems, segmentItemsBeforeRender, "activity segment render/toggle mutated original messages or thinking");
+
+    const customBoundaryItems = [
+      user,
+      segmentFirst.assistant,
+      ...segmentFirst.results,
+      customBetween,
+      segmentSecond.assistant,
+      ...segmentSecond.results,
+      segmentFinal,
+    ];
+    InteractiveMode.prototype.renderSessionItems.call(segmentInteractive, customBoundaryItems);
+    assert(markerTexts(segmentInteractive.renderedItems).length === 2, "custom item did not split adjacent activity segments");
+    assert(segmentInteractive.renderedItems.includes(customBetween), "custom activity boundary disappeared from render items");
+
+    const boundaryFirst = makeBatch("boundary_first", 130, ["read"]);
+    boundaryFirst.assistant.content = [
+      { type: "thinking", thinking: "boundary first thinking", thinkingSignature: "boundary-first-thinking" },
+      ...boundaryFirst.calls,
+    ];
+    const boundaryIncomplete = makeBatch("boundary_incomplete", 140, ["bash", "edit"]);
+    boundaryIncomplete.assistant.content = [
+      { type: "thinking", thinking: "boundary incomplete thinking", thinkingSignature: "boundary-incomplete-thinking" },
+      ...boundaryIncomplete.calls,
+    ];
+    const boundaryLast = makeBatch("boundary_last", 150, ["ffgrep"]);
+    boundaryLast.assistant.content = [
+      { type: "thinking", thinking: "boundary last thinking", thinkingSignature: "boundary-last-thinking" },
+      ...boundaryLast.calls,
+    ];
+    const failOpenBoundaryItems = [
+      user,
+      boundaryFirst.assistant,
+      ...boundaryFirst.results,
+      boundaryIncomplete.assistant,
+      boundaryIncomplete.results[0],
+      boundaryLast.assistant,
+      ...boundaryLast.results,
+      segmentFinal,
+    ];
+    InteractiveMode.prototype.renderSessionItems.call(segmentInteractive, failOpenBoundaryItems);
+    assert(markerTexts(segmentInteractive.renderedItems).length === 2, "incomplete batch did not split adjacent complete activity segments");
+    assert(toolCallCount(segmentInteractive.renderedItems) === 2, "incomplete boundary batch did not fail open");
+    assert(thinkingBlockCount(segmentInteractive.renderedItems) === 1, "incomplete boundary thinking should remain visible");
 
     const incomplete = makeBatch("incomplete", 60, ["read", "bash"]);
     const duplicate = makeBatch("duplicate", 70, ["read", "bash"]);
@@ -700,7 +844,7 @@ async function main() {
     assert(runtime.terminalInputListeners.length === 0, "off command left a raw terminal listener");
     assert(runtime.getToolsExpanded() === false, "off command did not restore tool expansion state");
     await runtime.shortcuts.get("alt+p").handler(runtime.ctx);
-    assert(runtime.notifications.at(-1)?.message === "工具批次折叠当前未启用。", "disabled shortcut should report that folding is inactive");
+    assert(runtime.notifications.at(-1)?.message === "工具活动折叠当前未启用。", "disabled shortcut should report that folding is inactive");
     await runtime.commands.get("codex-compact").handler("on", runtime.ctx);
     assert(InteractiveMode.prototype[interactivePatchSymbol], "on command did not restore InteractiveMode patch");
     assert(runtime.terminalInputListeners.length === 1, "on command registered duplicate raw terminal listeners");

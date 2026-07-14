@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Codex-style compact rendering for Pi: fold completed tool batches without changing session or LLM context.",
+  "description": "Codex-style compact rendering for Pi: preserve narrative text and fold completed thinking/tool activity without changing context.",
   "scripts": {
     "check": "node --check index.js && node --check index.cjs && node --check smoke-test.mjs",
     "test": "node smoke-test.mjs"

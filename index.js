@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const AUDIT_ENTRY_TYPE = "pi-codex-compact.hidden-commentary";
 const HIDDEN_SUMMARY_WIDGET_KEY = "pi-codex-compact.hidden-summary";
 const RENDER_PATCH_VERSION = 4;
-const INTERACTIVE_PATCH_VERSION = 8;
+const INTERACTIVE_PATCH_VERSION = 9;
 const RENDER_PATCH_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patched");
 const RENDER_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patch-data");
 const INTERACTIVE_PATCH_SYMBOL = Symbol.for("pi-codex-compact.interactive-render-patched");
@@ -266,10 +266,10 @@ function prepareMessageForRendering(message, config) {
   };
 }
 
-let expandedToolBatchKey = null;
+let expandedToolActivitySegmentKey = null;
 let activeToolBatchKey = null;
 let lastInteractiveModeInstance;
-let lastRenderedToolBatches = [];
+let lastRenderedToolActivitySegments = [];
 let rawToolBatchInputUnsubscribe;
 let patchedAssistantPrototype;
 let patchedInteractivePrototype;
@@ -277,9 +277,9 @@ let toolsExpandedBeforeEnable;
 let toolsExpandedCaptured = false;
 
 function resetToolBatchFoldState() {
-  expandedToolBatchKey = null;
+  expandedToolActivitySegmentKey = null;
   activeToolBatchKey = null;
-  lastRenderedToolBatches = [];
+  lastRenderedToolActivitySegments = [];
 }
 
 function isToolBatchFoldingEnabled(config) {
@@ -411,6 +411,95 @@ function scanToolBatches(items) {
   return batches.filter((batch) => keyCounts.get(batch.key) === 1);
 }
 
+function hasVisibleAssistantText(message) {
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+    return false;
+  }
+
+  return message.content.some(
+    (block) => block?.type === "text" && typeof block.text === "string" && block.text.trim().length > 0,
+  );
+}
+
+function scanToolActivitySegments(items, excludedBatchKey) {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  const batchesByIndex = new Map(
+    scanToolBatches(items)
+      .filter((batch) => batch.key !== excludedBatchKey)
+      .map((batch) => [batch.assistantIndex, batch]),
+  );
+  const segments = [];
+  let pendingSegment;
+
+  const finishPendingSegment = () => {
+    if (!pendingSegment || pendingSegment.batches.length === 0) {
+      pendingSegment = undefined;
+      return;
+    }
+
+    const counts = { total: 0, read: 0, search: 0, command: 0, modify: 0, other: 0, errors: 0 };
+    for (const batch of pendingSegment.batches) {
+      for (const key of Object.keys(counts)) {
+        counts[key] += batch.counts[key] ?? 0;
+      }
+    }
+
+    segments.push({
+      key: `tool_activity_segment_${stableHash(pendingSegment.batches.map((batch) => batch.key).join(":"))}`,
+      batches: pendingSegment.batches,
+      counts,
+      assistantIndexes: [...pendingSegment.assistantIndexes],
+      markerAssistantIndex: pendingSegment.batches[0].assistantIndex,
+    });
+    pendingSegment = undefined;
+  };
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const batch = batchesByIndex.get(index);
+    const hasToolCalls = getToolCalls(item).length > 0;
+
+    // Active, incomplete, malformed, or ambiguous batches are hard fail-open boundaries.
+    if (hasToolCalls && !batch) {
+      finishPendingSegment();
+      continue;
+    }
+
+    if (batch) {
+      // Narrative-bearing batches start a new segment; their text remains visible.
+      if (hasVisibleAssistantText(item)) {
+        finishPendingSegment();
+      }
+      if (!pendingSegment) {
+        pendingSegment = { batches: [], assistantIndexes: new Set() };
+      }
+      pendingSegment.batches.push(batch);
+      pendingSegment.assistantIndexes.add(index);
+      continue;
+    }
+
+    if (item?.role === "toolResult") {
+      continue;
+    }
+
+    if (item?.role === "assistant" && Array.isArray(item.content) && !hasVisibleAssistantText(item)) {
+      if (pendingSegment) {
+        pendingSegment.assistantIndexes.add(index);
+      }
+      continue;
+    }
+
+    // Visible assistant text, user input, and custom/compaction items separate segments.
+    finishPendingSegment();
+  }
+
+  finishPendingSegment();
+  return segments;
+}
+
 function formatToolBatchSummary(batch) {
   const counts = batch?.counts ?? {};
   const parts = [];
@@ -439,37 +528,43 @@ function formatToolBatchFoldMarker(batch, config) {
 
 function prepareItemsForToolBatchFolding(items, config) {
   if (!config.enabled || !config.foldCompletedToolBatches || !Array.isArray(items)) {
-    lastRenderedToolBatches = [];
+    lastRenderedToolActivitySegments = [];
     return items;
   }
 
-  const batches = scanToolBatches(items);
-  lastRenderedToolBatches = batches.filter((batch) => batch.key !== activeToolBatchKey);
-  const collapsedByIndex = new Map(
-    lastRenderedToolBatches
-      .filter((batch) => batch.key !== expandedToolBatchKey)
-      .map((batch) => [batch.assistantIndex, batch]),
+  lastRenderedToolActivitySegments = scanToolActivitySegments(items, activeToolBatchKey);
+  const collapsedSegments = lastRenderedToolActivitySegments.filter(
+    (segment) => segment.key !== expandedToolActivitySegmentKey,
   );
-  if (collapsedByIndex.size === 0) {
+  const collapsedByAssistantIndex = new Map();
+  for (const segment of collapsedSegments) {
+    for (const assistantIndex of segment.assistantIndexes) {
+      collapsedByAssistantIndex.set(assistantIndex, segment);
+    }
+  }
+  if (collapsedByAssistantIndex.size === 0) {
     return items;
   }
 
   return items.map((item, index) => {
-    const batch = collapsedByIndex.get(index);
-    if (!batch) {
+    const segment = collapsedByAssistantIndex.get(index);
+    if (!segment) {
       return item;
     }
 
     let markerAdded = false;
     const content = item.content.flatMap((block) => {
+      if (block?.type === "thinking") {
+        return [];
+      }
       if (block?.type !== "toolCall") {
         return [block];
       }
-      if (markerAdded) {
+      if (index !== segment.markerAssistantIndex || markerAdded) {
         return [];
       }
       markerAdded = true;
-      return [{ type: "text", text: formatToolBatchFoldMarker(batch, config) }];
+      return [{ type: "text", text: formatToolBatchFoldMarker(segment, config) }];
     });
     return { ...item, content };
   });
@@ -598,42 +693,42 @@ function registerToolBatchTerminalInput(ctx, config) {
     if (!isRawShortcutInput(data, config.toolBatchFoldShortcut)) {
       return undefined;
     }
-    toggleLatestToolBatch(ctx, config);
+    toggleLatestToolActivitySegment(ctx, config);
     return { consume: true };
   });
 }
 
-function getCurrentFoldableToolBatches(ctx) {
-  if (lastRenderedToolBatches.length > 0) {
-    return lastRenderedToolBatches;
+function getCurrentFoldableToolActivitySegments(ctx) {
+  if (lastRenderedToolActivitySegments.length > 0) {
+    return lastRenderedToolActivitySegments;
   }
 
   const sessionContext = safeSessionValue(ctx, "buildSessionContext", undefined, "session context read");
   if (!Array.isArray(sessionContext?.messages)) {
     return [];
   }
-  return scanToolBatches(sessionContext.messages).filter((batch) => batch.key !== activeToolBatchKey);
+  return scanToolActivitySegments(sessionContext.messages, activeToolBatchKey);
 }
 
-function toggleLatestToolBatch(ctx, config) {
+function toggleLatestToolActivitySegment(ctx, config) {
   if (!isToolBatchFoldingEnabled(config)) {
-    safeNotify(ctx, "工具批次折叠当前未启用。", "info");
+    safeNotify(ctx, "工具活动折叠当前未启用。", "info");
     return;
   }
 
-  const batches = getCurrentFoldableToolBatches(ctx);
-  const latest = batches.at(-1);
+  const segments = getCurrentFoldableToolActivitySegments(ctx);
+  const latest = segments.at(-1);
   if (!latest) {
-    safeNotify(ctx, "当前视图还没有可折叠的已完成工具批次。", "info");
+    safeNotify(ctx, "当前视图还没有可折叠的已完成工具活动。", "info");
     return;
   }
 
-  const willShow = expandedToolBatchKey !== latest.key;
-  expandedToolBatchKey = willShow ? latest.key : null;
+  const willShow = expandedToolActivitySegmentKey !== latest.key;
+  expandedToolActivitySegmentKey = willShow ? latest.key : null;
   const rebuilt = requestToolBatchRerender(ctx);
   safeNotify(
     ctx,
-    `工具批次已${willShow ? "展开" : "折叠"}：${formatToolBatchSummary(latest)}；${latest.counts.errors} 个错误；渲染${rebuilt ? "已重建" : "已请求"}。`,
+    `工具活动已${willShow ? "展开" : "折叠"}：${formatToolBatchSummary(latest)}；${latest.counts.errors} 个错误；渲染${rebuilt ? "已重建" : "已请求"}。`,
     "info",
   );
 }
@@ -1279,6 +1374,7 @@ function formatConfigSummary(config) {
     `Codex compact: ${config.enabled ? "on" : "off"}; ` +
     `strip commentary: ${config.stripCommentaryText ? "on" : "off"}; ` +
     `tool batch folding: ${config.foldCompletedToolBatches ? "on" : "off"}; ` +
+    "fold unit: narrative-bounded activity segment; " +
     `audit: ${config.auditHiddenCommentary ? "on" : "off"}; ` +
     `internal renderer patches: ${config.patchInternalRenderers ? "on" : "off"}; ` +
     `marker: ${config.showHiddenCommentaryMarker ? "on" : "off"}; ` +
@@ -1298,6 +1394,7 @@ async function formatDoctorReport(config) {
     `Extension enabled: ${config.enabled ? "yes" : "no"}`,
     `Finalized message filter: ${config.stripCommentaryText ? "enabled" : "disabled"}`,
     `Completed tool-batch folding: ${config.foldCompletedToolBatches ? "enabled" : "disabled"}`,
+    "Fold unit: narrative-bounded activity segment",
     `Audit entries: ${config.auditHiddenCommentary ? "enabled" : "disabled"}`,
     `Internal renderer patches: ${config.patchInternalRenderers ? "enabled" : "disabled"}`,
     `Hidden commentary marker: ${config.showHiddenCommentaryMarker ? "enabled" : "disabled"}`,
@@ -1386,7 +1483,7 @@ export default function piCodexCompact(pi) {
     if (activeToolBatchKey === batch.key) {
       activeToolBatchKey = null;
     }
-    expandedToolBatchKey = null;
+    expandedToolActivitySegmentKey = null;
   });
 
   pi.on("input", (event, ctx) => {
@@ -1395,7 +1492,7 @@ export default function piCodexCompact(pi) {
       return { action: "continue" };
     }
 
-    toggleLatestToolBatch(ctx, config);
+    toggleLatestToolActivitySegment(ctx, config);
     return { action: "handled" };
   });
 
@@ -1426,8 +1523,8 @@ export default function piCodexCompact(pi) {
 
   if (config.toolBatchFoldShortcut) {
     pi.registerShortcut(config.toolBatchFoldShortcut, {
-      description: "展开或折叠最近一个已完成工具批次",
-      handler: (ctx) => toggleLatestToolBatch(ctx, config),
+      description: "展开或折叠最近一个已完成工具活动段",
+      handler: (ctx) => toggleLatestToolActivitySegment(ctx, config),
     });
   }
 
@@ -1482,7 +1579,7 @@ export default function piCodexCompact(pi) {
         }
 
         if (subcommand === "toggle" || subcommand === "fold") {
-          toggleLatestToolBatch(ctx, config);
+          toggleLatestToolActivitySegment(ctx, config);
           return;
         }
 
