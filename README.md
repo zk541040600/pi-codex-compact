@@ -88,7 +88,7 @@ Runtime configuration is `/root/.pi/agent/extensions/pi-codex-compact/config.jso
 
 After editing non-shortcut configuration, run `/codex-compact reload`. Shortcut changes and extension-code changes require Pi `/reload`; Pi then tears down the old instance, restores patched prototypes/UI state, and lets `index.cjs` load a fresh module instance.
 
-## Pi 0.80.6 compatibility
+## Pi 0.80.6-0.80.7 compatibility
 
 The supported adapter is:
 
@@ -102,7 +102,7 @@ AssistantMessageComponent.updateContent(message)
 ToolExecutionComponent.render(width)
 ```
 
-Pi 0.80.6 does **not** expose `renderSessionContext()`. `/codex-compact doctor` reports the detected adapter (`component-state`), all three patch versions, individual method presence, and the true compatible/incompatible state. `rebuildChatFromMessages()` is reported for diagnostics but is deliberately not required or called by routine folding. If a required component method is missing, the extension fails open and leaves normal TUI rendering untouched.
+Supported Pi versions do **not** expose `renderSessionContext()`. `/codex-compact doctor` reports the detected adapter (`component-state`), all three patch versions, individual method presence, and the true compatible/incompatible state. `rebuildChatFromMessages()` is reported for diagnostics but is deliberately not required or called by routine folding. If a required component method is missing, the extension fails open and leaves normal TUI rendering untouched.
 
 The patched `handleEvent()` updates fold state after a complete tool-bearing `turn_end` and requests a normal TUI render. Individual `tool_execution_end` and `agent_end` events do not trigger activity folding. Alt+P refreshes the same component instances instead of reconstructing the transcript.
 
@@ -116,7 +116,7 @@ npm test
 
 The smoke suite verifies:
 
-- the installed package is Pi 0.80.6 with real `renderSessionItems` and without obsolete `renderSessionContext`;
+- the installed package is a supported Pi 0.80.6-0.80.7 build with real `renderSessionItems` and without obsolete `renderSessionContext`;
 - active, sequential, merged multi-batch activity, text boundaries, parallel completion-order, error, incomplete, duplicate, and orphan cases;
 - folded thinking removal, whole-segment thinking/tool restoration, transparent interleaved custom metadata, and preservation of narrative text, signatures, final text, custom entries, and result order;
 - zero chat rebuilds/clears at `turn_end` and Alt+P, stable assistant/tool component identity, and zero-row folded tool rendering with live result state retained;

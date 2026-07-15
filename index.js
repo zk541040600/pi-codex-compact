@@ -2100,7 +2100,7 @@ async function formatDoctorReport(config) {
     const compatible = assistantCompatible && toolCompatible && interactiveCompatible;
     lines.push(`Interactive adapter: ${compatible ? "component-state" : "none"}`);
     lines.push(`InteractiveMode.renderSessionItems: ${typeof prototype?.renderSessionItems === "function" ? "found" : "missing"}`);
-    lines.push(`InteractiveMode.renderSessionContext: ${typeof prototype?.renderSessionContext === "function" ? "found (unused)" : "missing (expected on Pi 0.80.6)"}`);
+    lines.push(`InteractiveMode.renderSessionContext: ${typeof prototype?.renderSessionContext === "function" ? "found (unused)" : "missing (expected on supported Pi)"}`);
     lines.push(`InteractiveMode.handleEvent: ${typeof prototype?.handleEvent === "function" ? "found" : "missing"}`);
     lines.push(`InteractiveMode.createExtensionUIContext: ${typeof prototype?.createExtensionUIContext === "function" ? "found" : "missing"}`);
     lines.push(`InteractiveMode.addExtensionTerminalInputListener: ${typeof prototype?.addExtensionTerminalInputListener === "function" ? "found" : "missing"}`);

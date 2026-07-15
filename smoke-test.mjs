@@ -295,7 +295,10 @@ async function main() {
   const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
   assert(settings.extensions?.includes("./extensions/pi-codex-compact/index.cjs"), "settings.json does not register the extension");
   const packageInfo = JSON.parse(readFileSync(join(piPackageRoot, "package.json"), "utf8"));
-  assert(packageInfo.version === "0.80.6", `smoke fixture expects Pi 0.80.6, found ${packageInfo.version}`);
+  assert(
+    ["0.80.6", "0.80.7"].includes(packageInfo.version),
+    `smoke fixture supports Pi 0.80.6-0.80.7, found ${packageInfo.version}`,
+  );
 
   const { AssistantMessageComponent } = await import(pathToFileURL(assistantMessagePath).href);
   const { ToolExecutionComponent } = await import(pathToFileURL(toolExecutionPath).href);
@@ -330,7 +333,7 @@ async function main() {
   const realRebuildChatFromMessages = InteractiveMode.prototype.rebuildChatFromMessages;
 
   assert(typeof realRenderSessionItems === "function", "installed Pi must expose renderSessionItems");
-  assert(realRenderSessionContext === undefined, "Pi 0.80.6 should not expose obsolete renderSessionContext");
+  assert(realRenderSessionContext === undefined, "supported Pi should not expose obsolete renderSessionContext");
 
   try {
     AssistantMessageComponent.prototype.updateContent = realUpdateContent;
@@ -394,7 +397,7 @@ async function main() {
     await realAdapterExtension(realAdapterRuntime.pi);
     await realAdapterRuntime.handlers.get("session_start")({ type: "session_start" }, realAdapterRuntime.ctx);
     const realPatchData = InteractiveMode.prototype[interactivePatchDataSymbol];
-    assert(realPatchData?.originalRenderSessionItems === realRenderSessionItems, "patch did not wrap Pi 0.80.6's real renderSessionItems");
+    assert(realPatchData?.originalRenderSessionItems === realRenderSessionItems, "patch did not wrap Pi's real renderSessionItems");
     assert(realPatchData?.adapter === "component-state", "real installed adapter should be component-state");
     assert(realPatchData?.version === 12, "unexpected real interactive patch version");
     await realAdapterRuntime.commands.get("codex-compact").handler("doctor", realAdapterRuntime.ctx);
@@ -407,7 +410,7 @@ async function main() {
       "ToolExecutionComponent.render: found",
       "Tool renderer patch version: 1",
       "InteractiveMode.renderSessionItems: found",
-      "InteractiveMode.renderSessionContext: missing (expected on Pi 0.80.6)",
+      "InteractiveMode.renderSessionContext: missing (expected on supported Pi)",
       "InteractiveMode.showExtensionNotify: found",
       "InteractiveMode.rebuildChatFromMessages: found",
       "Tool-batch fold patch version: 12",
@@ -595,7 +598,7 @@ async function main() {
       "ToolExecutionComponent.render: found",
       "Tool renderer patch version: 1",
       "InteractiveMode.renderSessionItems: found",
-      "InteractiveMode.renderSessionContext: missing (expected on Pi 0.80.6)",
+      "InteractiveMode.renderSessionContext: missing (expected on supported Pi)",
       "InteractiveMode.showExtensionNotify: found",
       "InteractiveMode.rebuildChatFromMessages: found",
       "Tool-batch fold patch version: 12",
