@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const AUDIT_ENTRY_TYPE = "pi-codex-compact.hidden-commentary";
 const HIDDEN_SUMMARY_WIDGET_KEY = "pi-codex-compact.hidden-summary";
 const RENDER_PATCH_VERSION = 4;
-const INTERACTIVE_PATCH_VERSION = 9;
+const INTERACTIVE_PATCH_VERSION = 10;
 const RENDER_PATCH_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patched");
 const RENDER_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patch-data");
 const INTERACTIVE_PATCH_SYMBOL = Symbol.for("pi-codex-compact.interactive-render-patched");
@@ -485,6 +485,11 @@ function scanToolActivitySegments(items, excludedBatchKey) {
       continue;
     }
 
+    // Extension metadata stays in the render stream but does not split one tool activity.
+    if (item?.type === "custom") {
+      continue;
+    }
+
     if (item?.role === "assistant" && Array.isArray(item.content) && !hasVisibleAssistantText(item)) {
       if (pendingSegment) {
         pendingSegment.assistantIndexes.add(index);
@@ -492,7 +497,7 @@ function scanToolActivitySegments(items, excludedBatchKey) {
       continue;
     }
 
-    // Visible assistant text, user input, and custom/compaction items separate segments.
+    // Visible assistant text, user input, compaction summaries, and other structural items separate segments.
     finishPendingSegment();
   }
 

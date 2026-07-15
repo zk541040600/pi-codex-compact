@@ -8,7 +8,7 @@ assistant commentary
 assistant final answer
 ```
 
-Collapsed activity segments hide their thinking and tool-call/result presentation. Assistant text, text signatures/metadata, custom entries, and final answers keep their original order and content; expanding a segment restores its original thinking and tool details.
+Collapsed activity segments hide their thinking and tool-call/result presentation. Assistant text, text signatures/metadata, custom entries, and final answers keep their original order and content; invisible custom metadata is transparent to grouping, and expanding a segment restores its original thinking and tool details.
 
 Press `alt+p` to expand or re-fold the latest completed activity segment. `/codex-compact toggle` (alias: `fold`) and bare input `codex-compact toggle` / `compact fold` remain available when a terminal does not deliver the shortcut.
 
@@ -17,7 +17,7 @@ Press `alt+p` to expand or re-fold the latest completed activity segment. `/code
 - A batch is one assistant message containing tool calls plus exactly one finalized result for every call ID.
 - An activity segment starts with a complete narrative-bearing batch and absorbs following complete batches that contain no assistant text. A standalone complete batch also forms a segment.
 - Any non-empty assistant `text` is a narrative boundary and is always preserved. The extension never guesses from wording or provider-specific commentary/final-answer signatures.
-- User messages, custom/compaction items, and active/incomplete/malformed batches end the current segment. This prevents one marker from spanning unrelated visible state.
+- User messages, compaction summaries, other structural items, and active/incomplete/malformed batches end the current segment. `type: "custom"` metadata stays in its original render position but does not split otherwise continuous tool activity.
 - The batch remains expanded while running, including the interval after individual parallel tools finish but before `turn_end`.
 - At a complete `turn_end`, the TUI rebuilds once and folds the completed activity segment. Earlier segments can stay folded while the next batch streams normally.
 - Duplicate or missing call IDs, duplicate/missing results, orphan results, failed/aborted assistant messages, and other unreliable pairings fail open and remain expanded.
@@ -115,7 +115,7 @@ The smoke suite verifies:
 
 - the installed package is Pi 0.80.6 with real `renderSessionItems` and without obsolete `renderSessionContext`;
 - active, sequential, merged multi-batch activity, text boundaries, parallel completion-order, error, incomplete, duplicate, and orphan cases;
-- folded thinking removal, whole-segment thinking/tool restoration, and preservation of narrative text, signatures, final text, custom entries, and result order;
+- folded thinking removal, whole-segment thinking/tool restoration, transparent interleaved custom metadata, and preservation of narrative text, signatures, final text, custom entries, and result order;
 - `Alt+P`, slash command, bare-input fallback, reload, stale extension contexts, and legacy commentary audit;
 - deep equality of `SessionManager.buildSessionContext().messages` before/after rendering and absence of virtual markers from session JSONL.
 

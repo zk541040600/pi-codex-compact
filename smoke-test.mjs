@@ -336,7 +336,7 @@ async function main() {
     const realPatchData = InteractiveMode.prototype[interactivePatchDataSymbol];
     assert(realPatchData?.originalRenderSessionItems === realRenderSessionItems, "patch did not wrap Pi 0.80.6's real renderSessionItems");
     assert(realPatchData?.adapter === "renderSessionItems", "real installed adapter should be renderSessionItems");
-    assert(realPatchData?.version === 9, "unexpected real interactive patch version");
+    assert(realPatchData?.version === 10, "unexpected real interactive patch version");
     await realAdapterRuntime.commands.get("codex-compact").handler("doctor", realAdapterRuntime.ctx);
     const realDoctor = realAdapterRuntime.notifications.at(-1)?.message ?? "";
     for (const expected of [
@@ -346,7 +346,7 @@ async function main() {
       "InteractiveMode.renderSessionItems: found",
       "InteractiveMode.renderSessionContext: missing (expected on Pi 0.80.6)",
       "InteractiveMode.rebuildChatFromMessages: found",
-      "Tool-batch fold patch version: 9",
+      "Tool-batch fold patch version: 10",
       "Tool-batch fold patch adapter: renderSessionItems",
       "Tool-batch fold patch check: compatible",
     ]) {
@@ -516,7 +516,7 @@ async function main() {
 
     const patchData = InteractiveMode.prototype[interactivePatchDataSymbol];
     assert(patchData?.adapter === "renderSessionItems", "active adapter should be renderSessionItems");
-    assert(patchData?.version === 9, "unexpected interactive patch version");
+    assert(patchData?.version === 10, "unexpected interactive patch version");
     await runtime.commands.get("codex-compact").handler("doctor", runtime.ctx);
     const doctor = runtime.notifications.at(-1)?.message ?? "";
     for (const expected of [
@@ -526,7 +526,7 @@ async function main() {
       "InteractiveMode.renderSessionItems: found",
       "InteractiveMode.renderSessionContext: missing (expected on Pi 0.80.6)",
       "InteractiveMode.rebuildChatFromMessages: found",
-      "Tool-batch fold patch version: 9",
+      "Tool-batch fold patch version: 10",
       "Tool-batch fold patch adapter: renderSessionItems",
       "Tool-batch fold patch check: compatible",
     ]) {
@@ -732,18 +732,55 @@ async function main() {
     assert(markerTexts(segmentInteractive.renderedItems).length === 1, "toggle did not re-fold the merged activity segment");
     assertDeepEqual(segmentItems, segmentItemsBeforeRender, "activity segment render/toggle mutated original messages or thinking");
 
-    const customBoundaryItems = [
+    const goalStateAfterAssistant = {
+      type: "custom",
+      customType: "pi-goal-state",
+      data: { status: "active" },
+      id: "goal-state-after-assistant",
+    };
+    const observationsAfterResult = {
+      type: "custom",
+      customType: "om.observations.recorded",
+      data: { count: 1 },
+      id: "observations-after-result",
+    };
+    const customInterleavedItems = [
       user,
       segmentFirst.assistant,
+      goalStateAfterAssistant,
       ...segmentFirst.results,
-      customBetween,
+      observationsAfterResult,
       segmentSecond.assistant,
       ...segmentSecond.results,
       segmentFinal,
     ];
-    InteractiveMode.prototype.renderSessionItems.call(segmentInteractive, customBoundaryItems);
-    assert(markerTexts(segmentInteractive.renderedItems).length === 2, "custom item did not split adjacent activity segments");
-    assert(segmentInteractive.renderedItems.includes(customBetween), "custom activity boundary disappeared from render items");
+    InteractiveMode.prototype.renderSessionItems.call(segmentInteractive, customInterleavedItems);
+    assert(markerTexts(segmentInteractive.renderedItems).length === 1, "custom metadata split one continuous activity segment");
+    for (const customEntry of [goalStateAfterAssistant, observationsAfterResult]) {
+      assert(segmentInteractive.renderedItems.includes(customEntry), `${customEntry.customType} disappeared from render items`);
+      assert(
+        segmentInteractive.renderedItems.indexOf(customEntry) === customInterleavedItems.indexOf(customEntry),
+        `${customEntry.customType} moved within the render stream`,
+      );
+    }
+
+    const compactionBoundary = {
+      role: "compactionSummary",
+      summary: "Earlier activity was compacted.",
+      timestamp: 125,
+    };
+    const compactionBoundaryItems = [
+      user,
+      segmentFirst.assistant,
+      ...segmentFirst.results,
+      compactionBoundary,
+      segmentSecond.assistant,
+      ...segmentSecond.results,
+      segmentFinal,
+    ];
+    InteractiveMode.prototype.renderSessionItems.call(segmentInteractive, compactionBoundaryItems);
+    assert(markerTexts(segmentInteractive.renderedItems).length === 2, "compaction summary did not split adjacent activity segments");
+    assert(segmentInteractive.renderedItems.includes(compactionBoundary), "compaction boundary disappeared from render items");
 
     const boundaryFirst = makeBatch("boundary_first", 130, ["read"]);
     boundaryFirst.assistant.content = [
