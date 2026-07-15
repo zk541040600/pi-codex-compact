@@ -6,7 +6,7 @@ const AUDIT_ENTRY_TYPE = "pi-codex-compact.hidden-commentary";
 const HIDDEN_SUMMARY_WIDGET_KEY = "pi-codex-compact.hidden-summary";
 const RENDER_PATCH_VERSION = 5;
 const TOOL_RENDER_PATCH_VERSION = 1;
-const INTERACTIVE_PATCH_VERSION = 12;
+const INTERACTIVE_PATCH_VERSION = 13;
 const RENDER_PATCH_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patched");
 const RENDER_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patch-data");
 const TOOL_RENDER_PATCH_SYMBOL = Symbol.for("pi-codex-compact.tool-renderer-patched");
@@ -869,6 +869,17 @@ function prepareItemsForToolBatchFolding(items, config) {
   return items;
 }
 
+function collapseCompactionSummaries(instance) {
+  for (const component of instance?.chatContainer?.children ?? []) {
+    if (
+      component?.message?.role === "compactionSummary"
+      && typeof component.setExpanded === "function"
+    ) {
+      component.setExpanded(false);
+    }
+  }
+}
+
 function closeOpenToolActivitySegment() {
   if (!openToolActivitySegment) {
     return;
@@ -1658,7 +1669,11 @@ async function patchInteractiveModeRenderer(ctx, config, componentPatchesReady =
     } else {
       applyToolActivitySegments([]);
     }
-    return patchData.originalRenderSessionItems.call(this, items, options);
+    const result = patchData.originalRenderSessionItems.call(this, items, options);
+    if (patchData?.config?.enabled && patchData.config.foldCompletedToolBatches) {
+      collapseCompactionSummaries(this);
+    }
+    return result;
   };
 
   prototype.handleEvent = async function patchedHandleEvent(event) {
@@ -1667,6 +1682,7 @@ async function patchInteractiveModeRenderer(ctx, config, componentPatchesReady =
     const result = await patchData.originalHandleEvent.call(this, event);
     if (patchData?.config?.enabled && patchData.config.foldCompletedToolBatches) {
       try {
+        collapseCompactionSummaries(this);
         handleLiveToolActivityEvent(event);
         if (["message_start", "message_end", "turn_end", "compaction_start"].includes(event?.type)) {
           this.ui?.requestRender?.();

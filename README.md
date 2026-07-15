@@ -18,6 +18,7 @@ Press `alt+p` to expand or re-fold the latest completed activity segment. `/code
 - An activity segment starts with a complete narrative-bearing batch and absorbs following complete batches that contain no assistant text. A standalone complete batch also forms a segment.
 - Any non-empty assistant `text` is a narrative boundary and is always preserved. The extension never guesses from wording or provider-specific commentary/final-answer signatures.
 - User messages, compaction summaries, other structural items, and active/incomplete/malformed batches end the current segment. `type: "custom"` metadata stays in its original render position but does not split otherwise continuous tool activity.
+- Compaction summaries start collapsed independently of the current tool-output expansion state; Pi's normal expand shortcut can still reveal them explicitly.
 - The batch remains expanded while running, including the interval after individual parallel tools finish but before `turn_end`.
 - At a complete `turn_end`, the extension updates the existing assistant component and hides the existing tool components in place. It does not clear or rebuild chat history, so the editor/footer remain anchored and earlier component identity is preserved.
 - Subagent batches, duplicate or missing call IDs, duplicate/missing results, orphan results, failed/aborted assistant messages, and other unreliable pairings fail open and remain expanded.

@@ -240,6 +240,16 @@ function createInteractiveRendererHarness(InteractiveMode, sessionManager, ui, g
       return undefined;
     },
     addMessageToChat(message) {
+      if (message?.role === "compactionSummary") {
+        chatContainer.addChild({
+          message,
+          expanded: this.toolOutputExpanded,
+          setExpanded(expanded) {
+            this.expanded = expanded;
+          },
+        });
+        return;
+      }
       if (message?.role !== "assistant" || !AssistantMessageComponentClass) {
         chatContainer.addChild({ renderedMessage: message });
         return;
@@ -399,7 +409,7 @@ async function main() {
     const realPatchData = InteractiveMode.prototype[interactivePatchDataSymbol];
     assert(realPatchData?.originalRenderSessionItems === realRenderSessionItems, "patch did not wrap Pi's real renderSessionItems");
     assert(realPatchData?.adapter === "component-state", "real installed adapter should be component-state");
-    assert(realPatchData?.version === 12, "unexpected real interactive patch version");
+    assert(realPatchData?.version === 13, "unexpected real interactive patch version");
     await realAdapterRuntime.commands.get("codex-compact").handler("doctor", realAdapterRuntime.ctx);
     const realDoctor = realAdapterRuntime.notifications.at(-1)?.message ?? "";
     for (const expected of [
@@ -413,7 +423,7 @@ async function main() {
       "InteractiveMode.renderSessionContext: missing (expected on supported Pi)",
       "InteractiveMode.showExtensionNotify: found",
       "InteractiveMode.rebuildChatFromMessages: found",
-      "Tool-batch fold patch version: 12",
+      "Tool-batch fold patch version: 13",
       "Tool-batch fold patch adapter: component-state",
       "Tool-batch fold patch check: compatible",
     ]) {
@@ -587,7 +597,7 @@ async function main() {
 
     const patchData = InteractiveMode.prototype[interactivePatchDataSymbol];
     assert(patchData?.adapter === "component-state", "active adapter should be component-state");
-    assert(patchData?.version === 12, "unexpected interactive patch version");
+    assert(patchData?.version === 13, "unexpected interactive patch version");
     await runtime.commands.get("codex-compact").handler("doctor", runtime.ctx);
     const doctor = runtime.notifications.at(-1)?.message ?? "";
     for (const expected of [
@@ -601,7 +611,7 @@ async function main() {
       "InteractiveMode.renderSessionContext: missing (expected on supported Pi)",
       "InteractiveMode.showExtensionNotify: found",
       "InteractiveMode.rebuildChatFromMessages: found",
-      "Tool-batch fold patch version: 12",
+      "Tool-batch fold patch version: 13",
       "Tool-batch fold patch adapter: component-state",
       "Tool-batch fold patch check: compatible",
     ]) {
@@ -972,9 +982,15 @@ async function main() {
       ...segmentSecond.results,
       segmentFinal,
     ];
+    segmentInteractive.toolOutputExpanded = true;
     InteractiveMode.prototype.renderSessionItems.call(segmentInteractive, compactionBoundaryItems);
     assert(markerTexts(segmentInteractive.renderedItems).length === 2, "compaction summary did not split adjacent activity segments");
     assert(segmentInteractive.renderedItems.includes(compactionBoundary), "compaction boundary disappeared from render items");
+    const compactionComponent = segmentInteractive.chatContainer.children.find(
+      (component) => component?.message === compactionBoundary,
+    );
+    assert(compactionComponent?.expanded === false, "compaction summary inherited expanded tool-output state");
+    segmentInteractive.toolOutputExpanded = false;
 
     const boundaryFirst = makeBatch("boundary_first", 130, ["read"]);
     boundaryFirst.assistant.content = [
