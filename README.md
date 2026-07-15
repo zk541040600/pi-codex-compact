@@ -8,7 +8,7 @@ assistant commentary
 assistant final answer
 ```
 
-Collapsed activity segments hide their thinking and tool-call/result presentation. Assistant text, text signatures/metadata, custom entries, and final answers keep their original order and content; invisible custom metadata is transparent to grouping, and expanding a segment restores its original thinking and tool details.
+Collapsed activity segments hide their thinking, tool-call/result presentation, and matching background `info` notices from observational memory or RTK rewrites. Assistant text, text signatures/metadata, custom entries, and final answers keep their original order and content; invisible custom metadata is transparent to grouping, and expanding a segment restores its original thinking, tool details, and notices.
 
 Press `alt+p` to expand or re-fold the latest completed activity segment. `/codex-compact toggle` (alias: `fold`) and bare input `codex-compact toggle` / `compact fold` remain available when a terminal does not deliver the shortcut.
 
@@ -22,6 +22,7 @@ Press `alt+p` to expand or re-fold the latest completed activity segment. `/code
 - At a complete `turn_end`, the extension updates the existing assistant component and hides the existing tool components in place. It does not clear or rebuild chat history, so the editor/footer remain anchored and earlier component identity is preserved.
 - Duplicate or missing call IDs, duplicate/missing results, orphan results, failed/aborted assistant messages, and other unreliable pairings fail open and remain expanded.
 - Summary counts aggregate every batch in the segment: reads (`read`), searches (`grep`/`rg`/`ffgrep`/`find`/`fffind`/`fast_context_search`), commands (`bash`), modifications (`edit`/`write`), other tools, and errors.
+- Informational notices beginning with `Observational memory:` or `RTK rewrite:` join the current activity marker as `后台通知 N 条`. Warnings and errors stay visible.
 - Folding is render-only. `InteractiveMode.renderSessionItems()` still receives the original items; the assistant component projects a virtual marker from its original message, while each folded `ToolExecutionComponent` renders zero rows without losing its result, error, image, or renderer state. No session message is appended or rewritten.
 - Existing `pi-codex-compact.process-group` custom entries remain harmless non-context history, but no new whole-process group is created at `agent_end` and old groups no longer drive rendering.
 - Legacy signed-commentary stripping and audit commands remain available independently; stripping is off by default.
@@ -96,6 +97,7 @@ InteractiveMode.renderSessionItems(items, options)
 InteractiveMode.handleEvent(event)
 InteractiveMode.createExtensionUIContext(...)
 InteractiveMode.addExtensionTerminalInputListener(...)
+InteractiveMode.showExtensionNotify(message, type)
 AssistantMessageComponent.updateContent(message)
 ToolExecutionComponent.render(width)
 ```
@@ -118,6 +120,7 @@ The smoke suite verifies:
 - active, sequential, merged multi-batch activity, text boundaries, parallel completion-order, error, incomplete, duplicate, and orphan cases;
 - folded thinking removal, whole-segment thinking/tool restoration, transparent interleaved custom metadata, and preservation of narrative text, signatures, final text, custom entries, and result order;
 - zero chat rebuilds/clears at `turn_end` and Alt+P, stable assistant/tool component identity, and zero-row folded tool rendering with live result state retained;
+- observational-memory/RTK informational notices joining the same marker, Alt+P restoration, and off/shutdown cleanup;
 - `Alt+P`, slash command, bare-input fallback, reload, stale extension contexts, and legacy commentary audit;
 - deep equality of `SessionManager.buildSessionContext().messages` before/after rendering and absence of virtual markers from session JSONL.
 

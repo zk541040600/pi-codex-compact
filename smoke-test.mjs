@@ -251,6 +251,9 @@ function createInteractiveRendererHarness(InteractiveMode, sessionManager, ui, g
     addCustomEntryToChat(entry) {
       chatContainer.addChild({ renderedCustomEntry: entry });
     },
+    showStatus(message) {
+      return InteractiveMode.prototype.showStatus.call(this, message);
+    },
     rebuildChatFromMessages() {
       this.rebuildCount += 1;
       chatContainer.clear();
@@ -317,6 +320,8 @@ async function main() {
     ?? InteractiveMode.prototype.createExtensionUIContext;
   const realAddExtensionTerminalInputListener = InteractiveMode.prototype[interactivePatchDataSymbol]?.originalAddExtensionTerminalInputListener
     ?? InteractiveMode.prototype.addExtensionTerminalInputListener;
+  const realShowExtensionNotify = InteractiveMode.prototype[interactivePatchDataSymbol]?.originalShowExtensionNotify
+    ?? InteractiveMode.prototype.showExtensionNotify;
   const realRebuildChatFromMessages = InteractiveMode.prototype.rebuildChatFromMessages;
 
   assert(typeof realRenderSessionItems === "function", "installed Pi must expose renderSessionItems");
@@ -331,6 +336,7 @@ async function main() {
     ToolExecutionComponent.prototype[toolRenderPatchDataSymbol] = undefined;
     InteractiveMode.prototype[interactivePatchSymbol] = false;
     InteractiveMode.prototype[interactivePatchDataSymbol] = undefined;
+    InteractiveMode.prototype.showExtensionNotify = realShowExtensionNotify;
 
     const nonTuiRuntime = createMockRuntime();
     nonTuiRuntime.ctx.mode = "json";
@@ -385,7 +391,7 @@ async function main() {
     const realPatchData = InteractiveMode.prototype[interactivePatchDataSymbol];
     assert(realPatchData?.originalRenderSessionItems === realRenderSessionItems, "patch did not wrap Pi 0.80.6's real renderSessionItems");
     assert(realPatchData?.adapter === "component-state", "real installed adapter should be component-state");
-    assert(realPatchData?.version === 11, "unexpected real interactive patch version");
+    assert(realPatchData?.version === 12, "unexpected real interactive patch version");
     await realAdapterRuntime.commands.get("codex-compact").handler("doctor", realAdapterRuntime.ctx);
     const realDoctor = realAdapterRuntime.notifications.at(-1)?.message ?? "";
     for (const expected of [
@@ -397,8 +403,9 @@ async function main() {
       "Tool renderer patch version: 1",
       "InteractiveMode.renderSessionItems: found",
       "InteractiveMode.renderSessionContext: missing (expected on Pi 0.80.6)",
+      "InteractiveMode.showExtensionNotify: found",
       "InteractiveMode.rebuildChatFromMessages: found",
-      "Tool-batch fold patch version: 11",
+      "Tool-batch fold patch version: 12",
       "Tool-batch fold patch adapter: component-state",
       "Tool-batch fold patch check: compatible",
     ]) {
@@ -530,6 +537,7 @@ async function main() {
     InteractiveMode.prototype.handleEvent = realHandleEvent;
     InteractiveMode.prototype.createExtensionUIContext = realCreateExtensionUIContext;
     InteractiveMode.prototype.addExtensionTerminalInputListener = realAddExtensionTerminalInputListener;
+    InteractiveMode.prototype.showExtensionNotify = realShowExtensionNotify;
     InteractiveMode.prototype[interactivePatchSymbol] = false;
     InteractiveMode.prototype[interactivePatchDataSymbol] = undefined;
 
@@ -571,7 +579,7 @@ async function main() {
 
     const patchData = InteractiveMode.prototype[interactivePatchDataSymbol];
     assert(patchData?.adapter === "component-state", "active adapter should be component-state");
-    assert(patchData?.version === 11, "unexpected interactive patch version");
+    assert(patchData?.version === 12, "unexpected interactive patch version");
     await runtime.commands.get("codex-compact").handler("doctor", runtime.ctx);
     const doctor = runtime.notifications.at(-1)?.message ?? "";
     for (const expected of [
@@ -583,8 +591,9 @@ async function main() {
       "Tool renderer patch version: 1",
       "InteractiveMode.renderSessionItems: found",
       "InteractiveMode.renderSessionContext: missing (expected on Pi 0.80.6)",
+      "InteractiveMode.showExtensionNotify: found",
       "InteractiveMode.rebuildChatFromMessages: found",
-      "Tool-batch fold patch version: 11",
+      "Tool-batch fold patch version: 12",
       "Tool-batch fold patch adapter: component-state",
       "Tool-batch fold patch check: compatible",
     ]) {
@@ -635,6 +644,14 @@ async function main() {
     });
     assert(fakeInteractive.rebuildCount === rebuildBeforeToolEnds, "non-turn_end event triggered a batch rebuild");
 
+    InteractiveMode.prototype.showExtensionNotify.call(
+      fakeInteractive,
+      "RTK rewrite: tail -n 80 service.log -> rtk read service.log --tail=80",
+      "info",
+    );
+    const rtkNoticeComponent = fakeInteractive.chatContainer.children.at(-1);
+    assert(rtkNoticeComponent.render(100).join("\n").includes("RTK rewrite:"), "active RTK notice should remain visible before turn_end");
+
     const firstTurnEnd = { type: "turn_end", message: first.assistant, toolResults: first.results };
     const childrenBeforeTurnEnd = [...fakeInteractive.chatContainer.children];
     const clearCountBeforeTurnEnd = fakeInteractive.chatContainer.clearCount;
@@ -668,6 +685,26 @@ async function main() {
     for (const expected of ["已读取 1 个文件", "搜索 1 次", "运行 1 个命令", "修改 1 次", "调用 1 个其他工具", "1 个错误"]) {
       assert(firstMarker.includes(expected), `tool summary missing: ${expected}`);
     }
+    assert(firstMarker.includes("后台通知 1 条"), "pending RTK notice was not merged into the completed activity marker");
+    assert(rtkNoticeComponent.render(100).length === 0, "completed activity left its RTK notice visible");
+
+    fakeInteractive.chatContainer.addChild({ render: () => ["status boundary"] });
+    InteractiveMode.prototype.showExtensionNotify.call(
+      fakeInteractive,
+      "Observational memory: observer running on ~13,315-token chunk",
+      "info",
+    );
+    const memoryNoticeComponent = fakeInteractive.chatContainer.children.at(-1);
+    assert(memoryNoticeComponent !== rtkNoticeComponent, "notice fixture did not create a second Pi status component");
+    assert(memoryNoticeComponent.render(100).length === 0, "post-turn observational-memory notice did not join the open activity segment");
+    assert(
+      markerTexts(fakeInteractive.renderedItems)[0]?.includes("后台通知 2 条"),
+      "activity marker did not update after an asynchronous observational-memory notice",
+    );
+    InteractiveMode.prototype.showExtensionNotify.call(fakeInteractive, "Ordinary Pi status stays visible", "info");
+    const ordinaryStatusComponent = fakeInteractive.chatContainer.children.at(-1);
+    assert(ordinaryStatusComponent !== memoryNoticeComponent, "ordinary status overwrote a captured activity notice");
+    assert(ordinaryStatusComponent.render(100).join("\n").includes("Ordinary Pi status"), "ordinary status was folded by prefix mistake");
     assert(fakeInteractive.renderedItems.includes(customBetween), "interleaved custom item moved or disappeared");
     assert(fakeInteractive.renderedItems.filter((item) => item.role === "toolResult").length === 5, "virtual render removed persisted result items");
     assert(fakeInteractive.renderedItems.includes(first.results[0]), "folding cloned or rewrote a large tool result");
@@ -691,6 +728,8 @@ async function main() {
     for (const [toolCallId, toolComponent] of toolsBeforeTurnEnd) {
       assert(toolComponent.render(100).length > 0, `Alt+P did not restore tool component ${toolCallId}`);
     }
+    assert(rtkNoticeComponent.render(100).join("\n").includes("RTK rewrite:"), "Alt+P did not restore RTK notice text");
+    assert(memoryNoticeComponent.render(100).join("\n").includes("Observational memory:"), "Alt+P did not restore observational-memory notice text");
     assert(JSON.stringify(fakeInteractive.renderedItems).includes("batch_one result 2"), "Alt+P did not restore error details");
     assert(JSON.stringify(fakeInteractive.renderedItems).includes("aW1hZ2U="), "Alt+P did not restore image output");
     const restoredErrorRow = fakeInteractive.chatContainer.children.find(
@@ -699,6 +738,8 @@ async function main() {
     assert(restoredErrorRow, "real Pi renderer did not hydrate the restored error result row");
     await runtime.commands.get("codex-compact").handler("toggle", runtime.ctx);
     assert(toolCallCount(fakeInteractive.renderedItems) === 0, "toggle command did not re-fold latest batch");
+    assert(rtkNoticeComponent.render(100).length === 0, "toggle command did not re-fold RTK notice");
+    assert(memoryNoticeComponent.render(100).length === 0, "toggle command did not re-fold observational-memory notice");
     assert(runtime.notifications.some((entry) => entry.message.includes("工具活动已展开")), "toggle did not report expanded state");
 
     const rawResult = runtime.terminalInputListeners[0]("\x1bp");
@@ -1024,6 +1065,13 @@ async function main() {
     );
     assert(markerTexts(fakeInteractive.renderedItems).length === 1, "lifecycle fixture did not start folded");
     assert(lifecycleTool?.render(100).length === 0, "lifecycle fixture tool did not start hidden");
+    InteractiveMode.prototype.showExtensionNotify.call(
+      fakeInteractive,
+      "Observational memory: 1 observation recorded",
+      "info",
+    );
+    const lifecycleNotice = fakeInteractive.chatContainer.children.at(-1);
+    assert(lifecycleNotice.render(100).length === 0, "lifecycle fixture notice did not start hidden");
 
     await runtime.commands.get("codex-compact").handler("off", runtime.ctx);
     assert(!AssistantMessageComponent.prototype[renderPatchSymbol], "off command left AssistantMessageComponent patched");
@@ -1031,6 +1079,7 @@ async function main() {
     assert(!InteractiveMode.prototype[interactivePatchSymbol], "off command left InteractiveMode patched");
     assert(lifecycleAssistant?.lastMessage === first.assistant, "off command left a virtual marker in the assistant component");
     assert(lifecycleTool?.render(100).length > 0, "off command left a tool component hidden");
+    assert(lifecycleNotice.render(100).join("\n").includes("Observational memory:"), "off command left a notification component hidden");
     assert(runtime.terminalInputListeners.length === 0, "off command left a raw terminal listener");
     assert(runtime.getToolsExpanded() === false, "off command did not restore tool expansion state");
     await runtime.shortcuts.get("alt+p").handler(runtime.ctx);
@@ -1125,6 +1174,7 @@ async function main() {
     InteractiveMode.prototype.handleEvent = realHandleEvent;
     InteractiveMode.prototype.createExtensionUIContext = realCreateExtensionUIContext;
     InteractiveMode.prototype.addExtensionTerminalInputListener = realAddExtensionTerminalInputListener;
+    InteractiveMode.prototype.showExtensionNotify = realShowExtensionNotify;
     InteractiveMode.prototype.rebuildChatFromMessages = realRebuildChatFromMessages;
     InteractiveMode.prototype[interactivePatchSymbol] = false;
     InteractiveMode.prototype[interactivePatchDataSymbol] = undefined;

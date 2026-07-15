@@ -6,7 +6,7 @@ const AUDIT_ENTRY_TYPE = "pi-codex-compact.hidden-commentary";
 const HIDDEN_SUMMARY_WIDGET_KEY = "pi-codex-compact.hidden-summary";
 const RENDER_PATCH_VERSION = 5;
 const TOOL_RENDER_PATCH_VERSION = 1;
-const INTERACTIVE_PATCH_VERSION = 11;
+const INTERACTIVE_PATCH_VERSION = 12;
 const RENDER_PATCH_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patched");
 const RENDER_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patch-data");
 const TOOL_RENDER_PATCH_SYMBOL = Symbol.for("pi-codex-compact.tool-renderer-patched");
@@ -14,6 +14,7 @@ const TOOL_RENDER_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.tool-renderer
 const INTERACTIVE_PATCH_SYMBOL = Symbol.for("pi-codex-compact.interactive-render-patched");
 const INTERACTIVE_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.interactive-render-patch-data");
 const INTERACTIVE_INSTANCE_SYMBOL = Symbol.for("pi-codex-compact.interactive-instance");
+const ACTIVITY_NOTICE_RENDER_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.activity-notice-render-patch-data");
 const REGISTRATION_KEY = Symbol.for("pi-codex-compact.registration");
 const INSTANCE_ID = `${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -276,6 +277,11 @@ let lastRenderedToolActivitySegments = [];
 let openToolActivitySegment;
 let foldedAssistantProjections = new Map();
 let foldedToolCallIds = new Set();
+let foldedActivityNoticeComponents = new WeakSet();
+const activityNoticeRecordsBySegmentKey = new Map();
+const activityNoticeRecordByTextComponent = new WeakMap();
+const pendingActivityNoticeRecords = new Set();
+const trackedActivityNoticeRecords = new Set();
 const assistantComponentSources = new WeakMap();
 const assistantComponentKeys = new WeakMap();
 const projectedAssistantSources = new WeakMap();
@@ -288,6 +294,7 @@ let toolsExpandedBeforeEnable;
 let toolsExpandedCaptured = false;
 
 function resetToolBatchFoldState() {
+  clearActivityNoticeState();
   expandedToolActivitySegmentKey = null;
   activeToolBatchKey = null;
   lastRenderedToolActivitySegments = [];
@@ -589,6 +596,137 @@ function scanToolActivitySegments(items, excludedBatchKey) {
   );
 }
 
+function isFoldableActivityNotice(message, type) {
+  if (type === "warning" || type === "error" || typeof message !== "string") {
+    return false;
+  }
+  return message.startsWith("Observational memory:") || message.startsWith("RTK rewrite:");
+}
+
+function patchActivityNoticeComponent(component) {
+  if (!component || typeof component.render !== "function") {
+    return false;
+  }
+  const currentPatch = component[ACTIVITY_NOTICE_RENDER_PATCH_DATA_SYMBOL];
+  if (currentPatch) {
+    return currentPatch.owner === INSTANCE_ID;
+  }
+
+  const originalRender = component.render;
+  component[ACTIVITY_NOTICE_RENDER_PATCH_DATA_SYMBOL] = { owner: INSTANCE_ID, originalRender };
+  component.render = function patchedActivityNoticeRender(width) {
+    if (foldedActivityNoticeComponents.has(this)) {
+      return [];
+    }
+    return originalRender.call(this, width);
+  };
+  return true;
+}
+
+function restoreActivityNoticeComponent(component) {
+  const patchData = component?.[ACTIVITY_NOTICE_RENDER_PATCH_DATA_SYMBOL];
+  if (patchData?.owner !== INSTANCE_ID || typeof patchData.originalRender !== "function") {
+    return;
+  }
+  component.render = patchData.originalRender;
+  component[ACTIVITY_NOTICE_RENDER_PATCH_DATA_SYMBOL] = undefined;
+}
+
+function unassignActivityNoticeRecord(record) {
+  pendingActivityNoticeRecords.delete(record);
+  for (const [segmentKey, records] of activityNoticeRecordsBySegmentKey) {
+    records.delete(record);
+    if (records.size === 0) {
+      activityNoticeRecordsBySegmentKey.delete(segmentKey);
+    }
+  }
+  foldedActivityNoticeComponents.delete(record.spacer);
+  foldedActivityNoticeComponents.delete(record.textComponent);
+}
+
+function releaseActivityNoticeRecord(record) {
+  unassignActivityNoticeRecord(record);
+  restoreActivityNoticeComponent(record.spacer);
+  restoreActivityNoticeComponent(record.textComponent);
+  activityNoticeRecordByTextComponent.delete(record.textComponent);
+  trackedActivityNoticeRecords.delete(record);
+}
+
+function clearActivityNoticeState() {
+  for (const record of [...trackedActivityNoticeRecords]) {
+    releaseActivityNoticeRecord(record);
+  }
+  activityNoticeRecordsBySegmentKey.clear();
+  pendingActivityNoticeRecords.clear();
+  foldedActivityNoticeComponents = new WeakSet();
+}
+
+function attachActivityNoticeRecord(record, segmentKey) {
+  unassignActivityNoticeRecord(record);
+  const records = activityNoticeRecordsBySegmentKey.get(segmentKey) ?? new Set();
+  records.add(record);
+  activityNoticeRecordsBySegmentKey.set(segmentKey, records);
+}
+
+function attachPendingActivityNotices(segmentKey) {
+  for (const record of [...pendingActivityNoticeRecords]) {
+    attachActivityNoticeRecord(record, segmentKey);
+  }
+}
+
+function discardPendingActivityNotices() {
+  for (const record of [...pendingActivityNoticeRecords]) {
+    releaseActivityNoticeRecord(record);
+  }
+}
+
+function captureActivityNotice(instance, message, type) {
+  if (type === "info" || type === undefined) {
+    const existing = activityNoticeRecordByTextComponent.get(instance?.lastStatusText);
+    if (!isFoldableActivityNotice(message, type)) {
+      if (existing) {
+        releaseActivityNoticeRecord(existing);
+        applyToolActivitySegments(lastRenderedToolActivitySegments, true);
+      }
+      return;
+    }
+
+    const textComponent = instance?.lastStatusText;
+    const spacer = instance?.lastStatusSpacer;
+    if (!textComponent || !spacer) {
+      return;
+    }
+
+    let record = existing;
+    if (!record) {
+      if (!patchActivityNoticeComponent(spacer) || !patchActivityNoticeComponent(textComponent)) {
+        restoreActivityNoticeComponent(spacer);
+        restoreActivityNoticeComponent(textComponent);
+        return;
+      }
+      record = { spacer, textComponent };
+      activityNoticeRecordByTextComponent.set(textComponent, record);
+      trackedActivityNoticeRecords.add(record);
+    }
+
+    // Keep Pi's next status update from overwriting a notice that Alt+P must restore.
+    if (instance.lastStatusText === textComponent) {
+      instance.lastStatusText = undefined;
+      instance.lastStatusSpacer = undefined;
+    }
+
+    unassignActivityNoticeRecord(record);
+    if (activeToolBatchKey || !openToolActivitySegment) {
+      pendingActivityNoticeRecords.add(record);
+      return;
+    }
+
+    attachActivityNoticeRecord(record, openToolActivitySegment.key);
+    applyToolActivitySegments(lastRenderedToolActivitySegments, true);
+    instance.ui?.requestRender?.();
+  }
+}
+
 function formatToolBatchSummary(batch) {
   const counts = batch?.counts ?? {};
   const parts = [];
@@ -597,6 +735,8 @@ function formatToolBatchSummary(batch) {
   if (counts.command > 0) parts.push(`运行 ${counts.command} 个命令`);
   if (counts.modify > 0) parts.push(`修改 ${counts.modify} 次`);
   if (counts.other > 0) parts.push(`调用 ${counts.other} 个其他工具`);
+  const noticeCount = activityNoticeRecordsBySegmentKey.get(batch?.key)?.size ?? 0;
+  if (noticeCount > 0) parts.push(`后台通知 ${noticeCount} 条`);
   return parts.join("、");
 }
 
@@ -682,6 +822,7 @@ function refreshFoldedAssistantComponents() {
 function applyToolActivitySegments(segments, refresh = false) {
   const nextAssistantProjections = new Map();
   const nextToolCallIds = new Set();
+  const nextFoldedActivityNoticeComponents = new WeakSet();
   for (const segment of segments) {
     if (segment.key === expandedToolActivitySegmentKey) {
       continue;
@@ -695,12 +836,17 @@ function applyToolActivitySegments(segments, refresh = false) {
     for (const toolCallId of segment.toolCallIds) {
       nextToolCallIds.add(toolCallId);
     }
+    for (const record of activityNoticeRecordsBySegmentKey.get(segment.key) ?? []) {
+      nextFoldedActivityNoticeComponents.add(record.spacer);
+      nextFoldedActivityNoticeComponents.add(record.textComponent);
+    }
   }
 
   lastRenderedToolActivitySegments = segments;
   openToolActivitySegment = segments.at(-1)?.openAtEnd ? segments.at(-1) : undefined;
   foldedAssistantProjections = nextAssistantProjections;
   foldedToolCallIds = nextToolCallIds;
+  foldedActivityNoticeComponents = nextFoldedActivityNoticeComponents;
   if (refresh) {
     refreshFoldedAssistantComponents();
   }
@@ -750,6 +896,7 @@ function appendCompletedBatchToLiveFold(batch) {
     : [batch.message];
   const segment = buildToolActivitySegment(batches, messages, [], true);
   if (!segment || hasFoldIdentityCollision(segment, previousOpen?.key)) {
+    discardPendingActivityNotices();
     closeOpenToolActivitySegment();
     return false;
   }
@@ -763,6 +910,7 @@ function appendCompletedBatchToLiveFold(batch) {
   }
 
   expandedToolActivitySegmentKey = null;
+  attachPendingActivityNotices(segment.key);
   applyToolActivitySegments(segments, true);
   return true;
 }
@@ -790,6 +938,7 @@ function appendTrailingAssistantToOpenSegment(message) {
 
 function handleLiveToolActivityEvent(event) {
   if (event?.type === "message_start" && event.message?.role === "user") {
+    discardPendingActivityNotices();
     closeOpenToolActivitySegment();
     return;
   }
@@ -800,6 +949,7 @@ function handleLiveToolActivityEvent(event) {
       const batch = inspectToolBatch(event.message, []);
       if (!batch?.valid) {
         activeToolBatchKey = null;
+        discardPendingActivityNotices();
         closeOpenToolActivitySegment();
       } else {
         activeToolBatchKey = batch.key;
@@ -812,6 +962,7 @@ function handleLiveToolActivityEvent(event) {
       hasVisibleAssistantText(event.message)
       || ![undefined, "stop"].includes(event.message.stopReason)
     ) {
+      discardPendingActivityNotices();
       closeOpenToolActivitySegment();
       return;
     }
@@ -823,12 +974,14 @@ function handleLiveToolActivityEvent(event) {
     const batch = isCompleteToolBatchEvent(event);
     activeToolBatchKey = null;
     if (!batch || !appendCompletedBatchToLiveFold(batch)) {
+      discardPendingActivityNotices();
       closeOpenToolActivitySegment();
     }
     return;
   }
 
   if (event?.type === "compaction_start") {
+    clearActivityNoticeState();
     closeOpenToolActivitySegment();
   }
 }
@@ -1369,6 +1522,9 @@ function restoreInteractiveModePatch(prototype, expectedOwner) {
   prototype.handleEvent = patchData.originalHandleEvent;
   prototype.createExtensionUIContext = patchData.originalCreateExtensionUIContext;
   prototype.addExtensionTerminalInputListener = patchData.originalAddExtensionTerminalInputListener;
+  if (typeof patchData.originalShowExtensionNotify === "function") {
+    prototype.showExtensionNotify = patchData.originalShowExtensionNotify;
+  }
   prototype[INTERACTIVE_PATCH_DATA_SYMBOL] = undefined;
   prototype[INTERACTIVE_PATCH_SYMBOL] = false;
   return true;
@@ -1460,6 +1616,7 @@ async function patchInteractiveModeRenderer(ctx, config, componentPatchesReady =
     || typeof prototype.handleEvent !== "function"
     || typeof prototype.createExtensionUIContext !== "function"
     || typeof prototype.addExtensionTerminalInputListener !== "function"
+    || typeof prototype.showExtensionNotify !== "function"
   ) {
     safeSetStatus(ctx, "codex-compact-fold", themeFg(ctx, "warning", "Codex tool-batch patch: incompatible"));
     return false;
@@ -1469,6 +1626,7 @@ async function patchInteractiveModeRenderer(ctx, config, componentPatchesReady =
   const originalHandleEvent = prototype.handleEvent;
   const originalCreateExtensionUIContext = prototype.createExtensionUIContext;
   const originalAddExtensionTerminalInputListener = prototype.addExtensionTerminalInputListener;
+  const originalShowExtensionNotify = prototype.showExtensionNotify;
   prototype[INTERACTIVE_PATCH_DATA_SYMBOL] = {
     version: INTERACTIVE_PATCH_VERSION,
     owner: INSTANCE_ID,
@@ -1477,12 +1635,14 @@ async function patchInteractiveModeRenderer(ctx, config, componentPatchesReady =
     originalHandleEvent,
     originalCreateExtensionUIContext,
     originalAddExtensionTerminalInputListener,
+    originalShowExtensionNotify,
     config,
   };
 
   prototype.renderSessionItems = function patchedRenderSessionItems(items, options) {
     lastInteractiveModeInstance = this;
     const patchData = prototype[INTERACTIVE_PATCH_DATA_SYMBOL];
+    clearActivityNoticeState();
     clearAssistantComponentRegistry();
     if (patchData?.config?.enabled && patchData.config.foldCompletedToolBatches) {
       prepareItemsForToolBatchFolding(items, patchData.config);
@@ -1525,6 +1685,16 @@ async function patchInteractiveModeRenderer(ctx, config, componentPatchesReady =
     lastInteractiveModeInstance = this;
     const patchData = prototype[INTERACTIVE_PATCH_DATA_SYMBOL];
     return patchData.originalAddExtensionTerminalInputListener.apply(this, args);
+  };
+
+  prototype.showExtensionNotify = function patchedShowExtensionNotify(message, type) {
+    lastInteractiveModeInstance = this;
+    const patchData = prototype[INTERACTIVE_PATCH_DATA_SYMBOL];
+    const result = patchData.originalShowExtensionNotify.call(this, message, type);
+    if (patchData?.config?.enabled && patchData.config.foldCompletedToolBatches) {
+      captureActivityNotice(this, message, type);
+    }
+    return result;
   };
 
   prototype[INTERACTIVE_PATCH_SYMBOL] = true;
@@ -1916,7 +2086,8 @@ async function formatDoctorReport(config) {
     const interactiveCompatible = typeof prototype?.renderSessionItems === "function"
       && typeof prototype?.handleEvent === "function"
       && typeof prototype?.createExtensionUIContext === "function"
-      && typeof prototype?.addExtensionTerminalInputListener === "function";
+      && typeof prototype?.addExtensionTerminalInputListener === "function"
+      && typeof prototype?.showExtensionNotify === "function";
     const compatible = assistantCompatible && toolCompatible && interactiveCompatible;
     lines.push(`Interactive adapter: ${compatible ? "component-state" : "none"}`);
     lines.push(`InteractiveMode.renderSessionItems: ${typeof prototype?.renderSessionItems === "function" ? "found" : "missing"}`);
@@ -1924,6 +2095,7 @@ async function formatDoctorReport(config) {
     lines.push(`InteractiveMode.handleEvent: ${typeof prototype?.handleEvent === "function" ? "found" : "missing"}`);
     lines.push(`InteractiveMode.createExtensionUIContext: ${typeof prototype?.createExtensionUIContext === "function" ? "found" : "missing"}`);
     lines.push(`InteractiveMode.addExtensionTerminalInputListener: ${typeof prototype?.addExtensionTerminalInputListener === "function" ? "found" : "missing"}`);
+    lines.push(`InteractiveMode.showExtensionNotify: ${typeof prototype?.showExtensionNotify === "function" ? "found" : "missing"}`);
     lines.push(`InteractiveMode.rebuildChatFromMessages: ${typeof prototype?.rebuildChatFromMessages === "function" ? "found" : "missing"}`);
     lines.push(`Tool-batch fold currently patched: ${prototype?.[INTERACTIVE_PATCH_SYMBOL] ? "yes" : "no"}`);
     lines.push(`Tool-batch fold patch version: ${prototype?.[INTERACTIVE_PATCH_DATA_SYMBOL]?.version ?? "legacy/unknown"}`);
