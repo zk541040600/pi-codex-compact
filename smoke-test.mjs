@@ -9,9 +9,11 @@ const configPath = join(__dirname, "config.json");
 const settingsPath = "/root/.pi/agent/settings.json";
 const piPackageRoot = "/root/node-v22.22.0-linux-x64/lib/node_modules/@earendil-works/pi-coding-agent";
 const assistantMessagePath = join(piPackageRoot, "dist/modes/interactive/components/assistant-message.js");
+const toolExecutionPath = join(piPackageRoot, "dist/modes/interactive/components/tool-execution.js");
 const interactiveModePath = join(piPackageRoot, "dist/modes/interactive/interactive-mode.js");
 const sessionManagerPath = join(piPackageRoot, "dist/core/session-manager.js");
 const themePath = join(piPackageRoot, "dist/modes/interactive/theme/theme.js");
+let AssistantMessageComponentClass;
 
 function assert(condition, message) {
   if (!condition) {
@@ -202,15 +204,17 @@ function thinkingBlockCount(items) {
 function createInteractiveRendererHarness(InteractiveMode, sessionManager, ui, getItems) {
   const chatContainer = {
     children: [],
+    clearCount: 0,
     addChild(component) {
       this.children.push(component);
     },
     clear() {
+      this.clearCount += 1;
       this.children = [];
     },
   };
 
-  return {
+  const harness = {
     sessionManager,
     session: { modelRegistry: {}, retryAttempt: 0 },
     settingsManager: {
@@ -223,14 +227,26 @@ function createInteractiveRendererHarness(InteractiveMode, sessionManager, ui, g
     chatContainer,
     toolOutputExpanded: false,
     ui,
-    renderedItems: undefined,
+    renderedSourceItems: undefined,
+    assistantComponents: new Map(),
     rebuildCount: 0,
     updateEditorBorderColor() {},
     getRegisteredToolDefinition() {
       return undefined;
     },
     addMessageToChat(message) {
-      chatContainer.addChild({ renderedMessage: message });
+      if (message?.role !== "assistant" || !AssistantMessageComponentClass) {
+        chatContainer.addChild({ renderedMessage: message });
+        return;
+      }
+      const component = new AssistantMessageComponentClass(message, true);
+      Object.defineProperty(component, "renderedMessage", {
+        configurable: true,
+        get: () => component.lastMessage,
+      });
+      const key = message.responseId ?? message.timestamp;
+      this.assistantComponents.set(key, component);
+      chatContainer.addChild(component);
     },
     addCustomEntryToChat(entry) {
       chatContainer.addChild({ renderedCustomEntry: entry });
@@ -241,6 +257,17 @@ function createInteractiveRendererHarness(InteractiveMode, sessionManager, ui, g
       InteractiveMode.prototype.renderSessionItems.call(this, getItems());
     },
   };
+  Object.defineProperty(harness, "renderedItems", {
+    configurable: true,
+    get() {
+      return (this.renderedSourceItems ?? []).map((item) => {
+        if (item?.role !== "assistant") return item;
+        const key = item.responseId ?? item.timestamp;
+        return this.assistantComponents.get(key)?.lastMessage ?? item;
+      });
+    },
+  });
+  return harness;
 }
 
 async function loadExtension() {
@@ -263,18 +290,24 @@ async function main() {
   assert(packageInfo.version === "0.80.6", `smoke fixture expects Pi 0.80.6, found ${packageInfo.version}`);
 
   const { AssistantMessageComponent } = await import(pathToFileURL(assistantMessagePath).href);
+  const { ToolExecutionComponent } = await import(pathToFileURL(toolExecutionPath).href);
   const { InteractiveMode } = await import(pathToFileURL(interactiveModePath).href);
   const { SessionManager, sessionEntryToContextMessages } = await import(pathToFileURL(sessionManagerPath).href);
   const { initTheme } = await import(pathToFileURL(themePath).href);
   initTheme("dark");
+  AssistantMessageComponentClass = AssistantMessageComponent;
   const renderPatchSymbol = Symbol.for("pi-codex-compact.assistant-renderer-patched");
   const renderPatchDataSymbol = Symbol.for("pi-codex-compact.assistant-renderer-patch-data");
+  const toolRenderPatchSymbol = Symbol.for("pi-codex-compact.tool-renderer-patched");
+  const toolRenderPatchDataSymbol = Symbol.for("pi-codex-compact.tool-renderer-patch-data");
   const interactivePatchSymbol = Symbol.for("pi-codex-compact.interactive-render-patched");
   const interactivePatchDataSymbol = Symbol.for("pi-codex-compact.interactive-render-patch-data");
   const registrationSymbol = Symbol.for("pi-codex-compact.registration");
 
   const realUpdateContent = AssistantMessageComponent.prototype[renderPatchDataSymbol]?.originalUpdateContent
     ?? AssistantMessageComponent.prototype.updateContent;
+  const realToolRender = ToolExecutionComponent.prototype[toolRenderPatchDataSymbol]?.originalRender
+    ?? ToolExecutionComponent.prototype.render;
   const realRenderSessionItems = InteractiveMode.prototype[interactivePatchDataSymbol]?.originalRenderSessionItems
     ?? InteractiveMode.prototype.renderSessionItems;
   const realRenderSessionContext = InteractiveMode.prototype.renderSessionContext;
@@ -293,6 +326,9 @@ async function main() {
     AssistantMessageComponent.prototype.updateContent = realUpdateContent;
     AssistantMessageComponent.prototype[renderPatchSymbol] = false;
     AssistantMessageComponent.prototype[renderPatchDataSymbol] = undefined;
+    ToolExecutionComponent.prototype.render = realToolRender;
+    ToolExecutionComponent.prototype[toolRenderPatchSymbol] = false;
+    ToolExecutionComponent.prototype[toolRenderPatchDataSymbol] = undefined;
     InteractiveMode.prototype[interactivePatchSymbol] = false;
     InteractiveMode.prototype[interactivePatchDataSymbol] = undefined;
 
@@ -317,14 +353,27 @@ async function main() {
     incompatibleRuntime.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, incompatibleRuntime.ctx);
 
     InteractiveMode.prototype.renderSessionItems = realRenderSessionItems;
+    ToolExecutionComponent.prototype.render = undefined;
+    const missingToolRuntime = createMockRuntime();
+    const missingToolExtension = await loadExtension();
+    await missingToolExtension(missingToolRuntime.pi);
+    await missingToolRuntime.handlers.get("session_start")({ type: "session_start" }, missingToolRuntime.ctx);
+    assert(!InteractiveMode.prototype[interactivePatchSymbol], "missing tool renderer should fail open without interactive folding");
+    assert(
+      missingToolRuntime.statuses.some((status) => status.key === "codex-compact-tool-render" && String(status.text).includes("incompatible")),
+      "missing ToolExecutionComponent.render should report an incompatible component adapter",
+    );
+    missingToolRuntime.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, missingToolRuntime.ctx);
+
+    ToolExecutionComponent.prototype.render = realToolRender;
     InteractiveMode.prototype.rebuildChatFromMessages = undefined;
     const missingRebuildRuntime = createMockRuntime();
     const missingRebuildExtension = await loadExtension();
     await missingRebuildExtension(missingRebuildRuntime.pi);
     await missingRebuildRuntime.handlers.get("session_start")({ type: "session_start" }, missingRebuildRuntime.ctx);
     assert(
-      missingRebuildRuntime.statuses.some((status) => status.key === "codex-compact-fold" && String(status.text).includes("incompatible")),
-      "missing rebuildChatFromMessages should report an incompatible adapter",
+      InteractiveMode.prototype[interactivePatchSymbol],
+      "component-state adapter should not depend on rebuildChatFromMessages",
     );
     missingRebuildRuntime.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, missingRebuildRuntime.ctx);
 
@@ -335,19 +384,22 @@ async function main() {
     await realAdapterRuntime.handlers.get("session_start")({ type: "session_start" }, realAdapterRuntime.ctx);
     const realPatchData = InteractiveMode.prototype[interactivePatchDataSymbol];
     assert(realPatchData?.originalRenderSessionItems === realRenderSessionItems, "patch did not wrap Pi 0.80.6's real renderSessionItems");
-    assert(realPatchData?.adapter === "renderSessionItems", "real installed adapter should be renderSessionItems");
-    assert(realPatchData?.version === 10, "unexpected real interactive patch version");
+    assert(realPatchData?.adapter === "component-state", "real installed adapter should be component-state");
+    assert(realPatchData?.version === 11, "unexpected real interactive patch version");
     await realAdapterRuntime.commands.get("codex-compact").handler("doctor", realAdapterRuntime.ctx);
     const realDoctor = realAdapterRuntime.notifications.at(-1)?.message ?? "";
     for (const expected of [
       "Completed tool-batch folding: enabled",
       "Fold unit: narrative-bounded activity segment",
-      "Interactive adapter: renderSessionItems",
+      "Renderer patch version: 5",
+      "Interactive adapter: component-state",
+      "ToolExecutionComponent.render: found",
+      "Tool renderer patch version: 1",
       "InteractiveMode.renderSessionItems: found",
       "InteractiveMode.renderSessionContext: missing (expected on Pi 0.80.6)",
       "InteractiveMode.rebuildChatFromMessages: found",
-      "Tool-batch fold patch version: 10",
-      "Tool-batch fold patch adapter: renderSessionItems",
+      "Tool-batch fold patch version: 11",
+      "Tool-batch fold patch adapter: component-state",
       "Tool-batch fold patch check: compatible",
     ]) {
       assert(realDoctor.includes(expected), `doctor output missing: ${expected}`);
@@ -471,6 +523,7 @@ async function main() {
     assert(!aliasRuntime.widgets.has("pi-codex-compact.hidden-summary"), "session shutdown left the summary widget visible");
     assert(aliasRuntime.getToolsExpanded() === false, "session shutdown did not restore the prior tool expansion state");
     assert(!AssistantMessageComponent.prototype[renderPatchSymbol], "session shutdown left AssistantMessageComponent patched");
+    assert(!ToolExecutionComponent.prototype[toolRenderPatchSymbol], "session shutdown left ToolExecutionComponent patched");
     assert(!InteractiveMode.prototype[interactivePatchSymbol], "session shutdown left InteractiveMode patched");
 
     InteractiveMode.prototype.renderSessionItems = realRenderSessionItems;
@@ -481,7 +534,9 @@ async function main() {
     InteractiveMode.prototype[interactivePatchDataSymbol] = undefined;
 
     InteractiveMode.prototype.renderSessionItems = function recordingRenderSessionItems(items, options) {
-      this.renderedItems = items;
+      this.chatContainer.clear();
+      this.assistantComponents.clear();
+      this.renderedSourceItems = items;
       this.renderOptions = options;
       return realRenderSessionItems.call(this, items, options);
     };
@@ -515,19 +570,22 @@ async function main() {
     await runtime.handlers.get("session_start")({ type: "session_start" }, runtime.ctx);
 
     const patchData = InteractiveMode.prototype[interactivePatchDataSymbol];
-    assert(patchData?.adapter === "renderSessionItems", "active adapter should be renderSessionItems");
-    assert(patchData?.version === 10, "unexpected interactive patch version");
+    assert(patchData?.adapter === "component-state", "active adapter should be component-state");
+    assert(patchData?.version === 11, "unexpected interactive patch version");
     await runtime.commands.get("codex-compact").handler("doctor", runtime.ctx);
     const doctor = runtime.notifications.at(-1)?.message ?? "";
     for (const expected of [
       "Completed tool-batch folding: enabled",
       "Fold unit: narrative-bounded activity segment",
-      "Interactive adapter: renderSessionItems",
+      "Renderer patch version: 5",
+      "Interactive adapter: component-state",
+      "ToolExecutionComponent.render: found",
+      "Tool renderer patch version: 1",
       "InteractiveMode.renderSessionItems: found",
       "InteractiveMode.renderSessionContext: missing (expected on Pi 0.80.6)",
       "InteractiveMode.rebuildChatFromMessages: found",
-      "Tool-batch fold patch version: 10",
-      "Tool-batch fold patch adapter: renderSessionItems",
+      "Tool-batch fold patch version: 11",
+      "Tool-batch fold patch adapter: component-state",
       "Tool-batch fold patch check: compatible",
     ]) {
       assert(doctor.includes(expected), `doctor output missing: ${expected}`);
@@ -578,9 +636,33 @@ async function main() {
     assert(fakeInteractive.rebuildCount === rebuildBeforeToolEnds, "non-turn_end event triggered a batch rebuild");
 
     const firstTurnEnd = { type: "turn_end", message: first.assistant, toolResults: first.results };
+    const childrenBeforeTurnEnd = [...fakeInteractive.chatContainer.children];
+    const clearCountBeforeTurnEnd = fakeInteractive.chatContainer.clearCount;
+    const assistantBeforeTurnEnd = fakeInteractive.assistantComponents.get(first.assistant.responseId);
+    const toolsBeforeTurnEnd = new Map(
+      fakeInteractive.chatContainer.children
+        .filter((child) => child?.toolCallId)
+        .map((child) => [child.toolCallId, child]),
+    );
     runtime.handlers.get("turn_end")(firstTurnEnd, runtime.ctx);
     await InteractiveMode.prototype.handleEvent.call(fakeInteractive, firstTurnEnd);
-    assert(fakeInteractive.rebuildCount === rebuildBeforeToolEnds + 1, "completed turn should rebuild exactly once");
+    assert(fakeInteractive.rebuildCount === rebuildBeforeToolEnds, "completed turn rebuilt the chat history");
+    assert(fakeInteractive.chatContainer.clearCount === clearCountBeforeTurnEnd, "completed turn cleared the chat container");
+    assert(
+      childrenBeforeTurnEnd.every((child, index) => fakeInteractive.chatContainer.children[index] === child),
+      "completed turn replaced or reordered existing chat components",
+    );
+    assert(
+      fakeInteractive.assistantComponents.get(first.assistant.responseId) === assistantBeforeTurnEnd,
+      "completed turn replaced the assistant component",
+    );
+    for (const [toolCallId, toolComponent] of toolsBeforeTurnEnd) {
+      assert(
+        fakeInteractive.chatContainer.children.includes(toolComponent),
+        `completed turn replaced tool component ${toolCallId}`,
+      );
+      assert(toolComponent.render(100).length === 0, `folded tool component ${toolCallId} still rendered rows`);
+    }
     assert(toolCallCount(fakeInteractive.renderedItems) === 0, "completed batch tool calls were not hidden");
     const firstMarker = markerTexts(fakeInteractive.renderedItems)[0] ?? "";
     for (const expected of ["已读取 1 个文件", "搜索 1 次", "运行 1 个命令", "修改 1 次", "调用 1 个其他工具", "1 个错误"]) {
@@ -600,6 +682,15 @@ async function main() {
     await runtime.shortcuts.get("alt+p").handler(runtime.ctx);
     assert(toolCallCount(fakeInteractive.renderedItems) === 5, "Alt+P did not restore calls");
     assert(thinkingBlockCount(fakeInteractive.renderedItems) === 1, "Alt+P did not restore thinking");
+    assert(fakeInteractive.rebuildCount === rebuildBeforeToolEnds, "Alt+P rebuilt the chat history");
+    assert(fakeInteractive.chatContainer.clearCount === clearCountBeforeTurnEnd, "Alt+P cleared the chat container");
+    assert(
+      fakeInteractive.assistantComponents.get(first.assistant.responseId) === assistantBeforeTurnEnd,
+      "Alt+P replaced the assistant component",
+    );
+    for (const [toolCallId, toolComponent] of toolsBeforeTurnEnd) {
+      assert(toolComponent.render(100).length > 0, `Alt+P did not restore tool component ${toolCallId}`);
+    }
     assert(JSON.stringify(fakeInteractive.renderedItems).includes("batch_one result 2"), "Alt+P did not restore error details");
     assert(JSON.stringify(fakeInteractive.renderedItems).includes("aW1hZ2U="), "Alt+P did not restore image output");
     const restoredErrorRow = fakeInteractive.chatContainer.children.find(
@@ -666,6 +757,56 @@ async function main() {
       stopReason: "stop",
       content: [textMessage("SEGMENT FINAL ANSWER", "final_answer", "segment-final")],
     };
+
+    const liveMergeItems = [segmentFirst.assistant, ...segmentFirst.results];
+    const liveMergeInteractive = createInteractiveRendererHarness(
+      InteractiveMode,
+      runtime.ctx.sessionManager,
+      runtime.ctx.ui,
+      () => liveMergeItems,
+    );
+    InteractiveMode.prototype.renderSessionItems.call(liveMergeInteractive, liveMergeItems);
+    const liveMarkerComponent = liveMergeInteractive.assistantComponents.get(segmentFirst.assistant.responseId);
+    const liveMarkerBefore = liveMarkerComponent?.lastMessage?.content.find(
+      (block) => block.type === "text" && block.text.startsWith("⌕ "),
+    )?.text ?? "";
+    const livePrefix = [...liveMergeInteractive.chatContainer.children];
+    const liveClearCount = liveMergeInteractive.chatContainer.clearCount;
+
+    const liveSecondAssistant = new AssistantMessageComponent(segmentSecond.assistant, true);
+    liveMergeInteractive.assistantComponents.set(segmentSecond.assistant.responseId, liveSecondAssistant);
+    liveMergeInteractive.chatContainer.addChild(liveSecondAssistant);
+    const liveSecondTools = [];
+    for (const [index, call] of segmentSecond.calls.entries()) {
+      const toolComponent = new ToolExecutionComponent(
+        call.name,
+        call.id,
+        call.arguments,
+        { showImages: false, imageWidthCells: 60 },
+        undefined,
+        runtime.ctx.ui,
+        process.cwd(),
+      );
+      toolComponent.updateResult(segmentSecond.results[index]);
+      liveMergeInteractive.chatContainer.addChild(toolComponent);
+      liveSecondTools.push(toolComponent);
+    }
+    runtime.handlers.get("message_end")({ type: "message_end", message: segmentSecond.assistant }, runtime.ctx);
+    const liveSecondTurnEnd = { type: "turn_end", message: segmentSecond.assistant, toolResults: segmentSecond.results };
+    runtime.handlers.get("turn_end")(liveSecondTurnEnd, runtime.ctx);
+    await InteractiveMode.prototype.handleEvent.call(liveMergeInteractive, liveSecondTurnEnd);
+
+    const liveMarkerAfter = liveMarkerComponent?.lastMessage?.content.find(
+      (block) => block.type === "text" && block.text.startsWith("⌕ "),
+    )?.text ?? "";
+    assert(liveMarkerBefore !== liveMarkerAfter, "consecutive live batch did not update the existing marker");
+    assert(liveMarkerAfter.includes("修改 1 次") && liveMarkerAfter.includes("1 个错误"), "live marker did not aggregate the appended batch");
+    assert(liveMergeInteractive.assistantComponents.get(segmentFirst.assistant.responseId) === liveMarkerComponent, "live merge replaced the marker component");
+    assert(liveMergeInteractive.chatContainer.clearCount === liveClearCount, "live merge cleared the chat container");
+    assert(liveMergeInteractive.rebuildCount === 0, "live merge rebuilt chat history");
+    assert(livePrefix.every((child, index) => liveMergeInteractive.chatContainer.children[index] === child), "live merge replaced the existing chat prefix");
+    assert(liveSecondTools.every((component) => component.render(100).length === 0), "live merge left appended tool components visible");
+
     const segmentItems = [user, segmentFirst.assistant];
     const segmentInteractive = createInteractiveRendererHarness(
       InteractiveMode,
@@ -694,7 +835,7 @@ async function main() {
     const segmentSecondTurnEnd = { type: "turn_end", message: segmentSecond.assistant, toolResults: segmentSecond.results };
     runtime.handlers.get("turn_end")(segmentSecondTurnEnd, runtime.ctx);
     await InteractiveMode.prototype.handleEvent.call(segmentInteractive, segmentSecondTurnEnd);
-    assert(segmentInteractive.rebuildCount === 2, "each completed activity batch should trigger exactly one rebuild");
+    assert(segmentInteractive.rebuildCount === 0, "completed activity batches rebuilt the chat history");
 
     segmentItems.push(segmentTrailingThinking, segmentFinal);
     const segmentItemsBeforeRender = structuredClone(segmentItems);
@@ -876,13 +1017,27 @@ async function main() {
     assert(fallbackLogs.some((line) => line.includes("Codex compact:")), "show command should survive stale notify context");
     assert(fallbackWarnings.some((line) => line.includes("notify UI call failed")), "unexpected UI failures should remain diagnosable");
 
+    InteractiveMode.prototype.renderSessionItems.call(fakeInteractive, [first.assistant, ...first.results]);
+    const lifecycleAssistant = fakeInteractive.assistantComponents.get(first.assistant.responseId);
+    const lifecycleTool = fakeInteractive.chatContainer.children.find(
+      (child) => child?.toolCallId === first.calls[0].id,
+    );
+    assert(markerTexts(fakeInteractive.renderedItems).length === 1, "lifecycle fixture did not start folded");
+    assert(lifecycleTool?.render(100).length === 0, "lifecycle fixture tool did not start hidden");
+
     await runtime.commands.get("codex-compact").handler("off", runtime.ctx);
+    assert(!AssistantMessageComponent.prototype[renderPatchSymbol], "off command left AssistantMessageComponent patched");
+    assert(!ToolExecutionComponent.prototype[toolRenderPatchSymbol], "off command left ToolExecutionComponent patched");
     assert(!InteractiveMode.prototype[interactivePatchSymbol], "off command left InteractiveMode patched");
+    assert(lifecycleAssistant?.lastMessage === first.assistant, "off command left a virtual marker in the assistant component");
+    assert(lifecycleTool?.render(100).length > 0, "off command left a tool component hidden");
     assert(runtime.terminalInputListeners.length === 0, "off command left a raw terminal listener");
     assert(runtime.getToolsExpanded() === false, "off command did not restore tool expansion state");
     await runtime.shortcuts.get("alt+p").handler(runtime.ctx);
     assert(runtime.notifications.at(-1)?.message === "工具活动折叠当前未启用。", "disabled shortcut should report that folding is inactive");
     await runtime.commands.get("codex-compact").handler("on", runtime.ctx);
+    assert(AssistantMessageComponent.prototype[renderPatchSymbol], "on command did not restore AssistantMessageComponent patch");
+    assert(ToolExecutionComponent.prototype[toolRenderPatchSymbol], "on command did not restore ToolExecutionComponent patch");
     assert(InteractiveMode.prototype[interactivePatchSymbol], "on command did not restore InteractiveMode patch");
     assert(runtime.terminalInputListeners.length === 1, "on command registered duplicate raw terminal listeners");
     assert(runtime.getToolsExpanded() === true, "on command did not reapply tool expansion state");
@@ -890,6 +1045,8 @@ async function main() {
 
     runtime.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, runtime.ctx);
     assert(runtime.terminalInputListeners.length === 0, "session shutdown should remove raw terminal listener");
+    assert(!AssistantMessageComponent.prototype[renderPatchSymbol], "session shutdown did not unpatch AssistantMessageComponent");
+    assert(!ToolExecutionComponent.prototype[toolRenderPatchSymbol], "session shutdown did not unpatch ToolExecutionComponent");
     assert(!InteractiveMode.prototype[interactivePatchSymbol], "session shutdown did not unpatch InteractiveMode");
 
     const contextFailureRuntime = createMockRuntime();
@@ -912,7 +1069,7 @@ async function main() {
     const reloadExtension = await loadExtension();
     await reloadExtension(reloadRuntime.pi);
     await reloadRuntime.handlers.get("session_start")({ type: "session_start" }, reloadRuntime.ctx);
-    assert(InteractiveMode.prototype[interactivePatchDataSymbol]?.adapter === "renderSessionItems", "reload kept a stale adapter closure");
+    assert(InteractiveMode.prototype[interactivePatchDataSymbol]?.adapter === "component-state", "reload kept a stale adapter closure");
     assert(InteractiveMode.prototype.renderSessionItems !== rendererBeforePiReload, "Pi reload reused the stale interactive closure");
     const patchBeforeConfigReload = InteractiveMode.prototype.renderSessionItems;
     await reloadRuntime.commands.get("codex-compact").handler("reload", reloadRuntime.ctx);
@@ -961,6 +1118,9 @@ async function main() {
     AssistantMessageComponent.prototype.updateContent = realUpdateContent;
     AssistantMessageComponent.prototype[renderPatchSymbol] = false;
     AssistantMessageComponent.prototype[renderPatchDataSymbol] = undefined;
+    ToolExecutionComponent.prototype.render = realToolRender;
+    ToolExecutionComponent.prototype[toolRenderPatchSymbol] = false;
+    ToolExecutionComponent.prototype[toolRenderPatchDataSymbol] = undefined;
     InteractiveMode.prototype.renderSessionItems = realRenderSessionItems;
     InteractiveMode.prototype.handleEvent = realHandleEvent;
     InteractiveMode.prototype.createExtensionUIContext = realCreateExtensionUIContext;

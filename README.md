@@ -19,10 +19,10 @@ Press `alt+p` to expand or re-fold the latest completed activity segment. `/code
 - Any non-empty assistant `text` is a narrative boundary and is always preserved. The extension never guesses from wording or provider-specific commentary/final-answer signatures.
 - User messages, compaction summaries, other structural items, and active/incomplete/malformed batches end the current segment. `type: "custom"` metadata stays in its original render position but does not split otherwise continuous tool activity.
 - The batch remains expanded while running, including the interval after individual parallel tools finish but before `turn_end`.
-- At a complete `turn_end`, the TUI rebuilds once and folds the completed activity segment. Earlier segments can stay folded while the next batch streams normally.
+- At a complete `turn_end`, the extension updates the existing assistant component and hides the existing tool components in place. It does not clear or rebuild chat history, so the editor/footer remain anchored and earlier component identity is preserved.
 - Duplicate or missing call IDs, duplicate/missing results, orphan results, failed/aborted assistant messages, and other unreliable pairings fail open and remain expanded.
 - Summary counts aggregate every batch in the segment: reads (`read`), searches (`grep`/`rg`/`ffgrep`/`find`/`fffind`/`fast_context_search`), commands (`bash`), modifications (`edit`/`write`), other tools, and errors.
-- Folding is render-only. It shallow-copies affected assistant messages passed to `InteractiveMode.renderSessionItems()`, removes the segment's virtual `thinking`/`toolCall` presentation, inserts one aggregate marker, and does not append or rewrite session messages.
+- Folding is render-only. `InteractiveMode.renderSessionItems()` still receives the original items; the assistant component projects a virtual marker from its original message, while each folded `ToolExecutionComponent` renders zero rows without losing its result, error, image, or renderer state. No session message is appended or rewritten.
 - Existing `pi-codex-compact.process-group` custom entries remain harmless non-context history, but no new whole-process group is created at `agent_end` and old groups no longer drive rendering.
 - Legacy signed-commentary stripping and audit commands remain available independently; stripping is off by default.
 
@@ -82,7 +82,7 @@ Runtime configuration is `/root/.pi/agent/extensions/pi-codex-compact/config.jso
 - `stripCommentaryText`: when `true`, finalized signed `commentary` text is removed using the legacy message filter and optionally audited. It defaults to `false`.
 - `auditHiddenCommentary`, `showHiddenCommentaryMarker`, `hiddenCommentaryMarker`, and `hiddenSummaryShortcut` control the existing audit/summary UI.
 - Commentary-only responses fail open and remain visible. Audit truncation counts Unicode code points, so it never stores half of a surrogate pair.
-- `patchInternalRenderers` is the master switch for both Pi-internal prototype adapters. Deprecated `patchAssistantRenderer` is accepted as an alias when the new key is absent.
+- `patchInternalRenderers` is the master switch for the assistant, tool, and interactive Pi-internal adapters. All three must be compatible or activity folding fails open. Deprecated `patchAssistantRenderer` is accepted as an alias when the new key is absent.
 - `assistantMessageModulePath` and `interactiveModeModulePath` can override Pi internal module discovery.
 
 After editing non-shortcut configuration, run `/codex-compact reload`. Shortcut changes and extension-code changes require Pi `/reload`; Pi then tears down the old instance, restores patched prototypes/UI state, and lets `index.cjs` load a fresh module instance.
@@ -96,12 +96,13 @@ InteractiveMode.renderSessionItems(items, options)
 InteractiveMode.handleEvent(event)
 InteractiveMode.createExtensionUIContext(...)
 InteractiveMode.addExtensionTerminalInputListener(...)
-InteractiveMode.rebuildChatFromMessages()
+AssistantMessageComponent.updateContent(message)
+ToolExecutionComponent.render(width)
 ```
 
-Pi 0.80.6 does **not** expose `renderSessionContext()`. `/codex-compact doctor` reports the detected adapter (`renderSessionItems`), patch version, individual method presence (including the rebuild method required for immediate `turn_end` folding), and the true compatible/incompatible state. If required methods are missing, the extension fails open and leaves normal TUI rendering untouched.
+Pi 0.80.6 does **not** expose `renderSessionContext()`. `/codex-compact doctor` reports the detected adapter (`component-state`), all three patch versions, individual method presence, and the true compatible/incompatible state. `rebuildChatFromMessages()` is reported for diagnostics but is deliberately not required or called by routine folding. If a required component method is missing, the extension fails open and leaves normal TUI rendering untouched.
 
-The patched `handleEvent()` rebuilds only after a complete tool-bearing `turn_end`; individual `tool_execution_end` and `agent_end` events do not trigger activity folding.
+The patched `handleEvent()` updates fold state after a complete tool-bearing `turn_end` and requests a normal TUI render. Individual `tool_execution_end` and `agent_end` events do not trigger activity folding. Alt+P refreshes the same component instances instead of reconstructing the transcript.
 
 ## Verification
 
@@ -116,6 +117,7 @@ The smoke suite verifies:
 - the installed package is Pi 0.80.6 with real `renderSessionItems` and without obsolete `renderSessionContext`;
 - active, sequential, merged multi-batch activity, text boundaries, parallel completion-order, error, incomplete, duplicate, and orphan cases;
 - folded thinking removal, whole-segment thinking/tool restoration, transparent interleaved custom metadata, and preservation of narrative text, signatures, final text, custom entries, and result order;
+- zero chat rebuilds/clears at `turn_end` and Alt+P, stable assistant/tool component identity, and zero-row folded tool rendering with live result state retained;
 - `Alt+P`, slash command, bare-input fallback, reload, stale extension contexts, and legacy commentary audit;
 - deep equality of `SessionManager.buildSessionContext().messages` before/after rendering and absence of virtual markers from session JSONL.
 

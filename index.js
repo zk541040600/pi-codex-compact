@@ -4,10 +4,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const AUDIT_ENTRY_TYPE = "pi-codex-compact.hidden-commentary";
 const HIDDEN_SUMMARY_WIDGET_KEY = "pi-codex-compact.hidden-summary";
-const RENDER_PATCH_VERSION = 4;
-const INTERACTIVE_PATCH_VERSION = 10;
+const RENDER_PATCH_VERSION = 5;
+const TOOL_RENDER_PATCH_VERSION = 1;
+const INTERACTIVE_PATCH_VERSION = 11;
 const RENDER_PATCH_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patched");
 const RENDER_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.assistant-renderer-patch-data");
+const TOOL_RENDER_PATCH_SYMBOL = Symbol.for("pi-codex-compact.tool-renderer-patched");
+const TOOL_RENDER_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.tool-renderer-patch-data");
 const INTERACTIVE_PATCH_SYMBOL = Symbol.for("pi-codex-compact.interactive-render-patched");
 const INTERACTIVE_PATCH_DATA_SYMBOL = Symbol.for("pi-codex-compact.interactive-render-patch-data");
 const INTERACTIVE_INSTANCE_SYMBOL = Symbol.for("pi-codex-compact.interactive-instance");
@@ -270,8 +273,16 @@ let expandedToolActivitySegmentKey = null;
 let activeToolBatchKey = null;
 let lastInteractiveModeInstance;
 let lastRenderedToolActivitySegments = [];
+let openToolActivitySegment;
+let foldedAssistantProjections = new Map();
+let foldedToolCallIds = new Set();
+const assistantComponentSources = new WeakMap();
+const assistantComponentKeys = new WeakMap();
+const projectedAssistantSources = new WeakMap();
+const assistantComponentsByKey = new Map();
 let rawToolBatchInputUnsubscribe;
 let patchedAssistantPrototype;
+let patchedToolExecutionPrototype;
 let patchedInteractivePrototype;
 let toolsExpandedBeforeEnable;
 let toolsExpandedCaptured = false;
@@ -280,6 +291,9 @@ function resetToolBatchFoldState() {
   expandedToolActivitySegmentKey = null;
   activeToolBatchKey = null;
   lastRenderedToolActivitySegments = [];
+  openToolActivitySegment = undefined;
+  foldedAssistantProjections = new Map();
+  foldedToolCallIds = new Set();
 }
 
 function isToolBatchFoldingEnabled(config) {
@@ -295,6 +309,19 @@ function getToolCalls(message) {
     return [];
   }
   return message.content.filter((block) => block?.type === "toolCall");
+}
+
+function assistantMessageKey(message) {
+  if (message?.role !== "assistant") {
+    return undefined;
+  }
+  if (typeof message.responseId === "string" && message.responseId.length > 0) {
+    return `assistant_response_${stableHash(message.responseId)}`;
+  }
+  if (message.timestamp === undefined || message.timestamp === null) {
+    return undefined;
+  }
+  return `assistant_${stableHash(String(message.timestamp))}`;
 }
 
 function toolBatchKey(message, calls) {
@@ -378,6 +405,15 @@ function scanToolBatches(items) {
     return [];
   }
 
+  const callIdCounts = new Map();
+  for (const item of items) {
+    for (const call of getToolCalls(item)) {
+      if (typeof call?.id === "string" && call.id.length > 0) {
+        callIdCounts.set(call.id, (callIdCounts.get(call.id) ?? 0) + 1);
+      }
+    }
+  }
+
   const batches = [];
   for (let index = 0; index < items.length; index += 1) {
     const message = items[index];
@@ -408,7 +444,10 @@ function scanToolBatches(items) {
     keyCounts.set(batch.key, (keyCounts.get(batch.key) ?? 0) + 1);
   }
 
-  return batches.filter((batch) => keyCounts.get(batch.key) === 1);
+  return batches.filter(
+    (batch) => keyCounts.get(batch.key) === 1
+      && batch.calls.every((call) => callIdCounts.get(call.id) === 1),
+  );
 }
 
 function hasVisibleAssistantText(message) {
@@ -419,6 +458,42 @@ function hasVisibleAssistantText(message) {
   return message.content.some(
     (block) => block?.type === "text" && typeof block.text === "string" && block.text.trim().length > 0,
   );
+}
+
+function buildToolActivitySegment(batches, assistantMessages, assistantIndexes = [], openAtEnd = false) {
+  if (!Array.isArray(batches) || batches.length === 0 || !Array.isArray(assistantMessages)) {
+    return undefined;
+  }
+
+  const assistantKeys = assistantMessages.map(assistantMessageKey);
+  if (assistantKeys.some((key) => !key) || new Set(assistantKeys).size !== assistantKeys.length) {
+    return undefined;
+  }
+
+  const toolCallIds = batches.flatMap((batch) => batch.calls.map((call) => call.id));
+  if (new Set(toolCallIds).size !== toolCallIds.length) {
+    return undefined;
+  }
+
+  const counts = { total: 0, read: 0, search: 0, command: 0, modify: 0, other: 0, errors: 0 };
+  for (const batch of batches) {
+    for (const key of Object.keys(counts)) {
+      counts[key] += batch.counts[key] ?? 0;
+    }
+  }
+
+  return {
+    key: `tool_activity_segment_${stableHash(batches[0].key)}`,
+    batches: [...batches],
+    counts,
+    assistantMessages: [...assistantMessages],
+    assistantKeys,
+    assistantIndexes: [...assistantIndexes],
+    markerAssistantKey: assistantMessageKey(batches[0].message),
+    markerAssistantIndex: batches[0].assistantIndex,
+    toolCallIds,
+    openAtEnd,
+  };
 }
 
 function scanToolActivitySegments(items, excludedBatchKey) {
@@ -434,26 +509,21 @@ function scanToolActivitySegments(items, excludedBatchKey) {
   const segments = [];
   let pendingSegment;
 
-  const finishPendingSegment = () => {
+  const finishPendingSegment = (openAtEnd = false) => {
     if (!pendingSegment || pendingSegment.batches.length === 0) {
       pendingSegment = undefined;
       return;
     }
 
-    const counts = { total: 0, read: 0, search: 0, command: 0, modify: 0, other: 0, errors: 0 };
-    for (const batch of pendingSegment.batches) {
-      for (const key of Object.keys(counts)) {
-        counts[key] += batch.counts[key] ?? 0;
-      }
+    const segment = buildToolActivitySegment(
+      pendingSegment.batches,
+      pendingSegment.assistantMessages,
+      pendingSegment.assistantIndexes,
+      openAtEnd,
+    );
+    if (segment) {
+      segments.push(segment);
     }
-
-    segments.push({
-      key: `tool_activity_segment_${stableHash(pendingSegment.batches.map((batch) => batch.key).join(":"))}`,
-      batches: pendingSegment.batches,
-      counts,
-      assistantIndexes: [...pendingSegment.assistantIndexes],
-      markerAssistantIndex: pendingSegment.batches[0].assistantIndex,
-    });
     pendingSegment = undefined;
   };
 
@@ -462,9 +532,11 @@ function scanToolActivitySegments(items, excludedBatchKey) {
     const batch = batchesByIndex.get(index);
     const hasToolCalls = getToolCalls(item).length > 0;
 
-    // Active, incomplete, malformed, or ambiguous batches are hard fail-open boundaries.
+    // Active batches stay expanded while preserving the preceding merge window; malformed batches close it.
     if (hasToolCalls && !batch) {
-      finishPendingSegment();
+      const calls = getToolCalls(item);
+      const isExcludedActiveBatch = toolBatchKey(item, calls) === excludedBatchKey;
+      finishPendingSegment(isExcludedActiveBatch);
       continue;
     }
 
@@ -474,10 +546,11 @@ function scanToolActivitySegments(items, excludedBatchKey) {
         finishPendingSegment();
       }
       if (!pendingSegment) {
-        pendingSegment = { batches: [], assistantIndexes: new Set() };
+        pendingSegment = { batches: [], assistantIndexes: new Set(), assistantMessages: [] };
       }
       pendingSegment.batches.push(batch);
       pendingSegment.assistantIndexes.add(index);
+      pendingSegment.assistantMessages.push(item);
       continue;
     }
 
@@ -493,6 +566,7 @@ function scanToolActivitySegments(items, excludedBatchKey) {
     if (item?.role === "assistant" && Array.isArray(item.content) && !hasVisibleAssistantText(item)) {
       if (pendingSegment) {
         pendingSegment.assistantIndexes.add(index);
+        pendingSegment.assistantMessages.push(item);
       }
       continue;
     }
@@ -501,8 +575,18 @@ function scanToolActivitySegments(items, excludedBatchKey) {
     finishPendingSegment();
   }
 
-  finishPendingSegment();
-  return segments;
+  finishPendingSegment(true);
+
+  // Message identity collisions make component-level projection ambiguous, so those segments fail open.
+  const assistantKeyCounts = new Map();
+  for (const segment of segments) {
+    for (const key of segment.assistantKeys) {
+      assistantKeyCounts.set(key, (assistantKeyCounts.get(key) ?? 0) + 1);
+    }
+  }
+  return segments.filter(
+    (segment) => segment.assistantKeys.every((key) => assistantKeyCounts.get(key) === 1),
+  );
 }
 
 function formatToolBatchSummary(batch) {
@@ -531,48 +615,222 @@ function formatToolBatchFoldMarker(batch, config) {
     .replaceAll("{action}", "show");
 }
 
+function projectAssistantForToolActivity(message, projection, config) {
+  if (message?.role !== "assistant" || !Array.isArray(message.content) || !projection) {
+    return message;
+  }
+
+  let markerAdded = false;
+  const content = message.content.flatMap((block) => {
+    if (block?.type === "thinking") {
+      return [];
+    }
+    if (block?.type !== "toolCall") {
+      return [block];
+    }
+    if (!projection.marker || markerAdded) {
+      return [];
+    }
+    markerAdded = true;
+    return [{ type: "text", text: formatToolBatchFoldMarker(projection.segment, config) }];
+  });
+  return { ...message, content };
+}
+
+function registerAssistantComponent(component, sourceMessage) {
+  const key = assistantMessageKey(sourceMessage);
+  const previousKey = assistantComponentKeys.get(component);
+  if (previousKey && previousKey !== key) {
+    const previousComponents = assistantComponentsByKey.get(previousKey);
+    previousComponents?.delete(component);
+    if (previousComponents?.size === 0) {
+      assistantComponentsByKey.delete(previousKey);
+    }
+  }
+
+  assistantComponentSources.set(component, sourceMessage);
+  if (!key) {
+    assistantComponentKeys.delete(component);
+    return;
+  }
+  assistantComponentKeys.set(component, key);
+  const components = assistantComponentsByKey.get(key) ?? new Set();
+  components.add(component);
+  assistantComponentsByKey.set(key, components);
+}
+
+function clearAssistantComponentRegistry() {
+  assistantComponentsByKey.clear();
+}
+
+function refreshFoldedAssistantComponents() {
+  for (const components of assistantComponentsByKey.values()) {
+    for (const component of components) {
+      const source = assistantComponentSources.get(component);
+      if (!source || typeof component.updateContent !== "function") {
+        continue;
+      }
+      try {
+        component.updateContent(source);
+      } catch (error) {
+        warnCompactUiFailure("assistant component refresh", error);
+      }
+    }
+  }
+}
+
+function applyToolActivitySegments(segments, refresh = false) {
+  const nextAssistantProjections = new Map();
+  const nextToolCallIds = new Set();
+  for (const segment of segments) {
+    if (segment.key === expandedToolActivitySegmentKey) {
+      continue;
+    }
+    for (const key of segment.assistantKeys) {
+      nextAssistantProjections.set(key, {
+        segment,
+        marker: key === segment.markerAssistantKey,
+      });
+    }
+    for (const toolCallId of segment.toolCallIds) {
+      nextToolCallIds.add(toolCallId);
+    }
+  }
+
+  lastRenderedToolActivitySegments = segments;
+  openToolActivitySegment = segments.at(-1)?.openAtEnd ? segments.at(-1) : undefined;
+  foldedAssistantProjections = nextAssistantProjections;
+  foldedToolCallIds = nextToolCallIds;
+  if (refresh) {
+    refreshFoldedAssistantComponents();
+  }
+}
+
 function prepareItemsForToolBatchFolding(items, config) {
   if (!config.enabled || !config.foldCompletedToolBatches || !Array.isArray(items)) {
-    lastRenderedToolActivitySegments = [];
+    applyToolActivitySegments([]);
     return items;
   }
 
-  lastRenderedToolActivitySegments = scanToolActivitySegments(items, activeToolBatchKey);
-  const collapsedSegments = lastRenderedToolActivitySegments.filter(
-    (segment) => segment.key !== expandedToolActivitySegmentKey,
+  applyToolActivitySegments(scanToolActivitySegments(items, activeToolBatchKey));
+  return items;
+}
+
+function closeOpenToolActivitySegment() {
+  if (!openToolActivitySegment) {
+    return;
+  }
+  const closed = { ...openToolActivitySegment, openAtEnd: false };
+  const segments = lastRenderedToolActivitySegments.map(
+    (segment) => segment.key === closed.key ? closed : segment,
   );
-  const collapsedByAssistantIndex = new Map();
-  for (const segment of collapsedSegments) {
-    for (const assistantIndex of segment.assistantIndexes) {
-      collapsedByAssistantIndex.set(assistantIndex, segment);
+  openToolActivitySegment = undefined;
+  applyToolActivitySegments(segments);
+}
+
+function hasFoldIdentityCollision(segment, ignoredSegmentKey) {
+  const existingAssistantKeys = new Set();
+  const existingToolCallIds = new Set();
+  for (const existing of lastRenderedToolActivitySegments) {
+    if (existing.key === ignoredSegmentKey) {
+      continue;
     }
+    for (const key of existing.assistantKeys) existingAssistantKeys.add(key);
+    for (const toolCallId of existing.toolCallIds) existingToolCallIds.add(toolCallId);
   }
-  if (collapsedByAssistantIndex.size === 0) {
-    return items;
+  return segment.assistantKeys.some((key) => existingAssistantKeys.has(key))
+    || segment.toolCallIds.some((toolCallId) => existingToolCallIds.has(toolCallId));
+}
+
+function appendCompletedBatchToLiveFold(batch) {
+  const previousOpen = hasVisibleAssistantText(batch.message) ? undefined : openToolActivitySegment;
+  const batches = previousOpen ? [...previousOpen.batches, batch] : [batch];
+  const messages = previousOpen
+    ? [...previousOpen.assistantMessages, batch.message]
+    : [batch.message];
+  const segment = buildToolActivitySegment(batches, messages, [], true);
+  if (!segment || hasFoldIdentityCollision(segment, previousOpen?.key)) {
+    closeOpenToolActivitySegment();
+    return false;
   }
 
-  return items.map((item, index) => {
-    const segment = collapsedByAssistantIndex.get(index);
-    if (!segment) {
-      return item;
+  let segments = lastRenderedToolActivitySegments;
+  if (previousOpen) {
+    segments = segments.map((existing) => existing.key === previousOpen.key ? segment : existing);
+  } else {
+    closeOpenToolActivitySegment();
+    segments = [...lastRenderedToolActivitySegments, segment];
+  }
+
+  expandedToolActivitySegmentKey = null;
+  applyToolActivitySegments(segments, true);
+  return true;
+}
+
+function appendTrailingAssistantToOpenSegment(message) {
+  if (!openToolActivitySegment || !assistantMessageKey(message)) {
+    return false;
+  }
+  const segment = buildToolActivitySegment(
+    openToolActivitySegment.batches,
+    [...openToolActivitySegment.assistantMessages, message],
+    openToolActivitySegment.assistantIndexes,
+    true,
+  );
+  if (!segment || hasFoldIdentityCollision(segment, openToolActivitySegment.key)) {
+    closeOpenToolActivitySegment();
+    return false;
+  }
+  const segments = lastRenderedToolActivitySegments.map(
+    (existing) => existing.key === openToolActivitySegment.key ? segment : existing,
+  );
+  applyToolActivitySegments(segments, true);
+  return true;
+}
+
+function handleLiveToolActivityEvent(event) {
+  if (event?.type === "message_start" && event.message?.role === "user") {
+    closeOpenToolActivitySegment();
+    return;
+  }
+
+  if (event?.type === "message_end" && event.message?.role === "assistant") {
+    const calls = getToolCalls(event.message);
+    if (calls.length > 0) {
+      const batch = inspectToolBatch(event.message, []);
+      if (!batch?.valid) {
+        activeToolBatchKey = null;
+        closeOpenToolActivitySegment();
+      } else {
+        activeToolBatchKey = batch.key;
+      }
+      return;
     }
 
-    let markerAdded = false;
-    const content = item.content.flatMap((block) => {
-      if (block?.type === "thinking") {
-        return [];
-      }
-      if (block?.type !== "toolCall") {
-        return [block];
-      }
-      if (index !== segment.markerAssistantIndex || markerAdded) {
-        return [];
-      }
-      markerAdded = true;
-      return [{ type: "text", text: formatToolBatchFoldMarker(segment, config) }];
-    });
-    return { ...item, content };
-  });
+    activeToolBatchKey = null;
+    if (
+      hasVisibleAssistantText(event.message)
+      || ![undefined, "stop"].includes(event.message.stopReason)
+    ) {
+      closeOpenToolActivitySegment();
+      return;
+    }
+    appendTrailingAssistantToOpenSegment(event.message);
+    return;
+  }
+
+  if (event?.type === "turn_end") {
+    const batch = isCompleteToolBatchEvent(event);
+    activeToolBatchKey = null;
+    if (!batch || !appendCompletedBatchToLiveFold(batch)) {
+      closeOpenToolActivitySegment();
+    }
+    return;
+  }
+
+  if (event?.type === "compaction_start") {
+    closeOpenToolActivitySegment();
+  }
 }
 
 function isCompleteToolBatchEvent(event) {
@@ -595,7 +853,7 @@ function stableHash(value) {
 
 function getInteractiveModeInstanceFromContext(ctx) {
   const instance = ctx?.ui?.[INTERACTIVE_INSTANCE_SYMBOL];
-  return instance?.rebuildChatFromMessages ? instance : undefined;
+  return typeof instance?.ui?.requestRender === "function" ? instance : undefined;
 }
 
 function isStaleExtensionContextError(error) {
@@ -640,20 +898,18 @@ function safeSessionEntries(ctx) {
 
 function requestToolBatchRerender(ctx) {
   const contextInstance = getInteractiveModeInstanceFromContext(ctx);
-  const instance = contextInstance?.rebuildChatFromMessages
-    ? contextInstance
-    : lastInteractiveModeInstance;
-  if (instance?.rebuildChatFromMessages) {
+  const instance = contextInstance ?? lastInteractiveModeInstance;
+  refreshFoldedAssistantComponents();
+  if (typeof instance?.ui?.requestRender === "function") {
     lastInteractiveModeInstance = instance;
     try {
-      instance.rebuildChatFromMessages();
+      instance.ui.requestRender();
       return true;
     } catch (error) {
-      warnCompactUiFailure("rebuild request", error);
+      warnCompactUiFailure("render request", error);
     }
   }
-  safeUiCall(ctx, "requestRender");
-  return false;
+  return safeUiCall(ctx, "requestRender");
 }
 
 function isRawShortcutInput(data, shortcut) {
@@ -730,10 +986,11 @@ function toggleLatestToolActivitySegment(ctx, config) {
 
   const willShow = expandedToolActivitySegmentKey !== latest.key;
   expandedToolActivitySegmentKey = willShow ? latest.key : null;
-  const rebuilt = requestToolBatchRerender(ctx);
+  applyToolActivitySegments(segments);
+  const renderRequested = requestToolBatchRerender(ctx);
   safeNotify(
     ctx,
-    `工具活动已${willShow ? "展开" : "折叠"}：${formatToolBatchSummary(latest)}；${latest.counts.errors} 个错误；渲染${rebuilt ? "已重建" : "已请求"}。`,
+    `工具活动已${willShow ? "展开" : "折叠"}：${formatToolBatchSummary(latest)}；${latest.counts.errors} 个错误；组件已更新${renderRequested ? "" : "，等待下次渲染"}。`,
     "info",
   );
 }
@@ -761,6 +1018,35 @@ function resolveAssistantMessageModulePath(config) {
 
   candidates.push(
     "/root/node-v22.22.0-linux-x64/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/assistant-message.js",
+  );
+
+  return candidates.find((candidate) => existsSync(candidate));
+}
+
+function resolveToolExecutionModulePath(config) {
+  const candidates = [];
+
+  if (process.env.PI_CODEX_COMPACT_TOOL_EXECUTION_MODULE) {
+    candidates.push(process.env.PI_CODEX_COMPACT_TOOL_EXECUTION_MODULE);
+  }
+
+  const assistantPath = resolveAssistantMessageModulePath(config);
+  if (assistantPath) {
+    candidates.push(join(dirname(assistantPath), "tool-execution.js"));
+  }
+
+  if (process.argv[1]) {
+    try {
+      const cliPath = realpathSync(process.argv[1]);
+      const packageRoot = dirname(dirname(cliPath));
+      candidates.push(join(packageRoot, "dist/modes/interactive/components/tool-execution.js"));
+    } catch {
+      // Ignore and try fallback candidates.
+    }
+  }
+
+  candidates.push(
+    "/root/node-v22.22.0-linux-x64/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js",
   );
 
   return candidates.find((candidate) => existsSync(candidate));
@@ -830,7 +1116,9 @@ function unpatchOwnedAssistantRenderer() {
 }
 
 async function patchAssistantRenderer(ctx, config) {
-  const shouldPatch = config.enabled && config.patchInternalRenderers && config.stripCommentaryText;
+  const shouldPatch = config.enabled
+    && config.patchInternalRenderers
+    && (config.stripCommentaryText || config.foldCompletedToolBatches);
 
   const modulePath = resolveAssistantMessageModulePath(config);
   if (!modulePath) {
@@ -902,16 +1190,152 @@ async function patchAssistantRenderer(ctx, config) {
   };
   prototype.updateContent = function patchedUpdateContent(message) {
     const patchData = prototype[RENDER_PATCH_DATA_SYMBOL];
-    const renderMessage = patchData?.config?.enabled
-      && patchData.config.patchInternalRenderers
-      && patchData.config.stripCommentaryText
-      ? prepareMessageForRendering(message, patchData.config)
+    const sourceMessage = message && typeof message === "object"
+      ? projectedAssistantSources.get(message) ?? message
       : message;
+    registerAssistantComponent(this, sourceMessage);
+
+    let renderMessage = sourceMessage;
+    if (patchData?.config?.enabled && patchData.config.patchInternalRenderers) {
+      if (patchData.config.stripCommentaryText) {
+        renderMessage = prepareMessageForRendering(renderMessage, patchData.config);
+      }
+      if (patchData.config.foldCompletedToolBatches) {
+        const projection = foldedAssistantProjections.get(assistantMessageKey(sourceMessage));
+        renderMessage = projectAssistantForToolActivity(renderMessage, projection, patchData.config);
+      }
+    }
+    if (renderMessage && typeof renderMessage === "object" && renderMessage !== sourceMessage) {
+      projectedAssistantSources.set(renderMessage, sourceMessage);
+    }
     return patchData.originalUpdateContent.call(this, renderMessage);
   };
   prototype[RENDER_PATCH_SYMBOL] = true;
   patchedAssistantPrototype = prototype;
   safeSetStatus(ctx, "codex-compact-render", undefined);
+  return true;
+}
+
+function restoreToolExecutionRendererPatch(prototype, expectedOwner) {
+  if (!prototype?.[TOOL_RENDER_PATCH_SYMBOL]) {
+    return true;
+  }
+
+  const patchData = prototype[TOOL_RENDER_PATCH_DATA_SYMBOL];
+  if (expectedOwner && patchData?.owner !== expectedOwner) {
+    return false;
+  }
+  if (typeof patchData?.originalRender !== "function") {
+    return false;
+  }
+
+  prototype.render = patchData.originalRender;
+  prototype[TOOL_RENDER_PATCH_DATA_SYMBOL] = undefined;
+  prototype[TOOL_RENDER_PATCH_SYMBOL] = false;
+  return true;
+}
+
+function unpatchOwnedToolExecutionRenderer() {
+  if (!patchedToolExecutionPrototype) {
+    return true;
+  }
+
+  const patchData = patchedToolExecutionPrototype[TOOL_RENDER_PATCH_DATA_SYMBOL];
+  if (patchData?.owner === INSTANCE_ID && patchData.config) {
+    patchData.config = { ...patchData.config, enabled: false };
+  }
+  const restored = restoreToolExecutionRendererPatch(patchedToolExecutionPrototype, INSTANCE_ID);
+  if (restored) {
+    patchedToolExecutionPrototype = undefined;
+  }
+  return restored;
+}
+
+async function patchToolExecutionRenderer(ctx, config) {
+  const shouldPatch = isToolBatchFoldingEnabled(config);
+  const modulePath = resolveToolExecutionModulePath(config);
+  if (!modulePath) {
+    safeSetStatus(
+      ctx,
+      "codex-compact-tool-render",
+      shouldPatch ? themeFg(ctx, "warning", "Codex tool render patch: unavailable") : undefined,
+    );
+    return false;
+  }
+
+  const mod = await import(pathToFileURL(modulePath).href);
+  const prototype = mod.ToolExecutionComponent?.prototype;
+  if (!prototype) {
+    safeSetStatus(
+      ctx,
+      "codex-compact-tool-render",
+      shouldPatch ? themeFg(ctx, "warning", "Codex tool render patch: incompatible") : undefined,
+    );
+    return false;
+  }
+
+  if (patchedToolExecutionPrototype && patchedToolExecutionPrototype !== prototype) {
+    if (!unpatchOwnedToolExecutionRenderer()) {
+      safeSetStatus(ctx, "codex-compact-tool-render", themeFg(ctx, "warning", "Codex tool render patch: stale patch cleanup failed"));
+      return false;
+    }
+  }
+
+  if (!shouldPatch) {
+    if (prototype[TOOL_RENDER_PATCH_SYMBOL] && !restoreToolExecutionRendererPatch(prototype)) {
+      safeSetStatus(ctx, "codex-compact-tool-render", themeFg(ctx, "warning", "Codex tool render patch: stale patch cleanup failed"));
+      return false;
+    }
+    if (patchedToolExecutionPrototype === prototype) {
+      patchedToolExecutionPrototype = undefined;
+    }
+    safeSetStatus(ctx, "codex-compact-tool-render", undefined);
+    return false;
+  }
+
+  const currentPatch = prototype[TOOL_RENDER_PATCH_DATA_SYMBOL];
+  if (
+    prototype[TOOL_RENDER_PATCH_SYMBOL]
+    && currentPatch?.version === TOOL_RENDER_PATCH_VERSION
+    && currentPatch?.owner === INSTANCE_ID
+  ) {
+    currentPatch.config = config;
+    patchedToolExecutionPrototype = prototype;
+    safeSetStatus(ctx, "codex-compact-tool-render", undefined);
+    return true;
+  }
+
+  if (prototype[TOOL_RENDER_PATCH_SYMBOL] && !restoreToolExecutionRendererPatch(prototype)) {
+    safeSetStatus(ctx, "codex-compact-tool-render", themeFg(ctx, "warning", "Codex tool render patch: existing patch is incompatible"));
+    return false;
+  }
+  if (typeof prototype.render !== "function") {
+    safeSetStatus(ctx, "codex-compact-tool-render", themeFg(ctx, "warning", "Codex tool render patch: incompatible"));
+    return false;
+  }
+
+  const originalRender = prototype.render;
+  prototype[TOOL_RENDER_PATCH_DATA_SYMBOL] = {
+    version: TOOL_RENDER_PATCH_VERSION,
+    owner: INSTANCE_ID,
+    originalRender,
+    config,
+  };
+  prototype.render = function patchedToolExecutionRender(width) {
+    const patchData = prototype[TOOL_RENDER_PATCH_DATA_SYMBOL];
+    if (
+      patchData?.config?.enabled
+      && patchData.config.patchInternalRenderers
+      && patchData.config.foldCompletedToolBatches
+      && foldedToolCallIds.has(this.toolCallId)
+    ) {
+      return [];
+    }
+    return patchData.originalRender.call(this, width);
+  };
+  prototype[TOOL_RENDER_PATCH_SYMBOL] = true;
+  patchedToolExecutionPrototype = prototype;
+  safeSetStatus(ctx, "codex-compact-tool-render", undefined);
   return true;
 }
 
@@ -966,15 +1390,16 @@ function unpatchOwnedInteractiveMode() {
   return restored;
 }
 
-async function patchInteractiveModeRenderer(ctx, config) {
-  const shouldPatch = isToolBatchFoldingEnabled(config);
+async function patchInteractiveModeRenderer(ctx, config, componentPatchesReady = true) {
+  const wantsPatch = isToolBatchFoldingEnabled(config);
+  const shouldPatch = wantsPatch && componentPatchesReady;
 
   const modulePath = resolveInteractiveModeModulePath(config);
   if (!modulePath) {
     safeSetStatus(
       ctx,
       "codex-compact-fold",
-      shouldPatch ? themeFg(ctx, "warning", "Codex tool-batch patch: unavailable") : undefined,
+      wantsPatch ? themeFg(ctx, "warning", "Codex tool-batch patch: unavailable") : undefined,
     );
     return false;
   }
@@ -985,7 +1410,7 @@ async function patchInteractiveModeRenderer(ctx, config) {
     safeSetStatus(
       ctx,
       "codex-compact-fold",
-      shouldPatch ? themeFg(ctx, "warning", "Codex tool-batch patch: incompatible") : undefined,
+      wantsPatch ? themeFg(ctx, "warning", "Codex tool-batch patch: incompatible") : undefined,
     );
     return false;
   }
@@ -1005,7 +1430,11 @@ async function patchInteractiveModeRenderer(ctx, config) {
     if (patchedInteractivePrototype === prototype) {
       patchedInteractivePrototype = undefined;
     }
-    safeSetStatus(ctx, "codex-compact-fold", undefined);
+    safeSetStatus(
+      ctx,
+      "codex-compact-fold",
+      wantsPatch ? themeFg(ctx, "warning", "Codex tool-batch patch: component adapter unavailable") : undefined,
+    );
     return false;
   }
 
@@ -1031,7 +1460,6 @@ async function patchInteractiveModeRenderer(ctx, config) {
     || typeof prototype.handleEvent !== "function"
     || typeof prototype.createExtensionUIContext !== "function"
     || typeof prototype.addExtensionTerminalInputListener !== "function"
-    || typeof prototype.rebuildChatFromMessages !== "function"
   ) {
     safeSetStatus(ctx, "codex-compact-fold", themeFg(ctx, "warning", "Codex tool-batch patch: incompatible"));
     return false;
@@ -1044,7 +1472,7 @@ async function patchInteractiveModeRenderer(ctx, config) {
   prototype[INTERACTIVE_PATCH_DATA_SYMBOL] = {
     version: INTERACTIVE_PATCH_VERSION,
     owner: INSTANCE_ID,
-    adapter: "renderSessionItems",
+    adapter: "component-state",
     originalRenderSessionItems,
     originalHandleEvent,
     originalCreateExtensionUIContext,
@@ -1055,21 +1483,27 @@ async function patchInteractiveModeRenderer(ctx, config) {
   prototype.renderSessionItems = function patchedRenderSessionItems(items, options) {
     lastInteractiveModeInstance = this;
     const patchData = prototype[INTERACTIVE_PATCH_DATA_SYMBOL];
-    const renderItems = patchData?.config?.enabled && patchData.config.foldCompletedToolBatches
-      ? prepareItemsForToolBatchFolding(items, patchData.config)
-      : items;
-    return patchData.originalRenderSessionItems.call(this, renderItems, options);
+    clearAssistantComponentRegistry();
+    if (patchData?.config?.enabled && patchData.config.foldCompletedToolBatches) {
+      prepareItemsForToolBatchFolding(items, patchData.config);
+    } else {
+      applyToolActivitySegments([]);
+    }
+    return patchData.originalRenderSessionItems.call(this, items, options);
   };
 
   prototype.handleEvent = async function patchedHandleEvent(event) {
     lastInteractiveModeInstance = this;
     const patchData = prototype[INTERACTIVE_PATCH_DATA_SYMBOL];
     const result = await patchData.originalHandleEvent.call(this, event);
-    if (patchData?.config?.enabled && patchData.config.foldCompletedToolBatches && isCompleteToolBatchEvent(event)) {
+    if (patchData?.config?.enabled && patchData.config.foldCompletedToolBatches) {
       try {
-        this.rebuildChatFromMessages?.();
+        handleLiveToolActivityEvent(event);
+        if (["message_start", "message_end", "turn_end", "compaction_start"].includes(event?.type)) {
+          this.ui?.requestRender?.();
+        }
       } catch (error) {
-        warnCompactUiFailure("turn_end rebuild", error);
+        warnCompactUiFailure("live component fold", error);
       }
     }
     return result;
@@ -1193,6 +1627,7 @@ function resetUiConfig(ctx) {
   safeUiCall(ctx, "setWorkingIndicator");
   safeSetStatus(ctx, "codex-compact", undefined);
   safeSetStatus(ctx, "codex-compact-render", undefined);
+  safeSetStatus(ctx, "codex-compact-tool-render", undefined);
   safeSetStatus(ctx, "codex-compact-fold", undefined);
 }
 
@@ -1209,7 +1644,8 @@ async function enableCompactRuntime(ctx, config) {
   if (!config.enabled) {
     try {
       await patchAssistantRenderer(ctx, config);
-      await patchInteractiveModeRenderer(ctx, config);
+      await patchToolExecutionRenderer(ctx, config);
+      await patchInteractiveModeRenderer(ctx, config, false);
     } catch (error) {
       warnCompactUiFailure("disabled runtime cleanup", error);
     }
@@ -1226,13 +1662,23 @@ async function enableCompactRuntime(ctx, config) {
   }
 
   try {
-    const patched = await patchAssistantRenderer(ctx, config);
-    const foldPatched = await patchInteractiveModeRenderer(ctx, config);
-    registerToolBatchTerminalInput(ctx, config);
+    const assistantPatched = await patchAssistantRenderer(ctx, config);
+    const toolPatched = await patchToolExecutionRenderer(ctx, config);
+    const foldPatched = await patchInteractiveModeRenderer(
+      ctx,
+      config,
+      assistantPatched && toolPatched,
+    );
+    if (foldPatched) {
+      registerToolBatchTerminalInput(ctx, config);
+    } else {
+      unregisterToolBatchTerminalInput();
+      resetToolBatchFoldState();
+    }
     safeSetStatus(
       ctx,
       "codex-compact",
-      themeFg(ctx, "dim", `Codex compact: on${patched ? " + render patch" : ""}${foldPatched ? " + fold patch" : ""}`),
+      themeFg(ctx, "dim", `Codex compact: on${assistantPatched ? " + assistant patch" : ""}${toolPatched ? " + tool patch" : ""}${foldPatched ? " + component-state fold" : ""}`),
     );
   } catch (error) {
     safeSetStatus(ctx, "codex-compact", themeFg(ctx, "warning", "Codex compact: on; render patch failed"));
@@ -1245,8 +1691,10 @@ function disableCompactRuntime(ctx) {
   resetToolBatchFoldState();
   unregisterToolBatchTerminalInput();
   unpatchOwnedAssistantRenderer();
+  unpatchOwnedToolExecutionRenderer();
   unpatchOwnedInteractiveMode();
   requestToolBatchRerender(ctx);
+  clearAssistantComponentRegistry();
   resetUiConfig(ctx);
   lastInteractiveModeInstance = undefined;
 }
@@ -1260,6 +1708,7 @@ let hiddenSummaryWidgetVisible = false;
 
 function resetEphemeralRuntimeState() {
   resetToolBatchFoldState();
+  clearAssistantComponentRegistry();
   lastInteractiveModeInstance = undefined;
   hiddenSummaryWidgetVisible = false;
   toolsExpandedBeforeEnable = undefined;
@@ -1409,6 +1858,7 @@ async function formatDoctorReport(config) {
 
   const modulePath = resolveAssistantMessageModulePath(config);
   lines.push(`Assistant renderer module: ${modulePath ?? "not found"}`);
+  let assistantCompatible = false;
 
   if (!config.patchInternalRenderers) {
     lines.push("Renderer patch check: skipped; disabled by config");
@@ -1419,12 +1869,34 @@ async function formatDoctorReport(config) {
       const mod = await import(pathToFileURL(modulePath).href);
       const prototype = mod.AssistantMessageComponent?.prototype;
       const compatible = typeof prototype?.updateContent === "function";
+      assistantCompatible = compatible;
       lines.push(`AssistantMessageComponent.updateContent: ${compatible ? "found" : "missing"}`);
       lines.push(`Renderer currently patched: ${prototype?.[RENDER_PATCH_SYMBOL] ? "yes" : "no"}`);
       lines.push(`Renderer patch version: ${prototype?.[RENDER_PATCH_DATA_SYMBOL]?.version ?? "legacy/unknown"}`);
       lines.push(`Renderer patch check: ${compatible ? "compatible" : "incompatible"}`);
     } catch (error) {
       lines.push(`Renderer patch check: import failed (${error instanceof Error ? error.message : String(error)})`);
+    }
+  }
+
+  const toolPath = resolveToolExecutionModulePath(config);
+  lines.push(`Tool renderer module: ${toolPath ?? "not found"}`);
+  let toolCompatible = false;
+  if (!config.patchInternalRenderers || !config.foldCompletedToolBatches) {
+    lines.push("Tool renderer patch check: skipped; disabled by config");
+  } else if (!toolPath) {
+    lines.push("Tool renderer patch check: failed; tool renderer module was not found");
+  } else {
+    try {
+      const mod = await import(pathToFileURL(toolPath).href);
+      const prototype = mod.ToolExecutionComponent?.prototype;
+      toolCompatible = typeof prototype?.render === "function";
+      lines.push(`ToolExecutionComponent.render: ${toolCompatible ? "found" : "missing"}`);
+      lines.push(`Tool renderer currently patched: ${prototype?.[TOOL_RENDER_PATCH_SYMBOL] ? "yes" : "no"}`);
+      lines.push(`Tool renderer patch version: ${prototype?.[TOOL_RENDER_PATCH_DATA_SYMBOL]?.version ?? "legacy/unknown"}`);
+      lines.push(`Tool renderer patch check: ${toolCompatible ? "compatible" : "incompatible"}`);
+    } catch (error) {
+      lines.push(`Tool renderer patch check: import failed (${error instanceof Error ? error.message : String(error)})`);
     }
   }
 
@@ -1441,12 +1913,12 @@ async function formatDoctorReport(config) {
   try {
     const mod = await import(pathToFileURL(interactivePath).href);
     const prototype = mod.InteractiveMode?.prototype;
-    const compatible = typeof prototype?.renderSessionItems === "function"
+    const interactiveCompatible = typeof prototype?.renderSessionItems === "function"
       && typeof prototype?.handleEvent === "function"
       && typeof prototype?.createExtensionUIContext === "function"
-      && typeof prototype?.addExtensionTerminalInputListener === "function"
-      && typeof prototype?.rebuildChatFromMessages === "function";
-    lines.push(`Interactive adapter: ${compatible ? "renderSessionItems" : "none"}`);
+      && typeof prototype?.addExtensionTerminalInputListener === "function";
+    const compatible = assistantCompatible && toolCompatible && interactiveCompatible;
+    lines.push(`Interactive adapter: ${compatible ? "component-state" : "none"}`);
     lines.push(`InteractiveMode.renderSessionItems: ${typeof prototype?.renderSessionItems === "function" ? "found" : "missing"}`);
     lines.push(`InteractiveMode.renderSessionContext: ${typeof prototype?.renderSessionContext === "function" ? "found (unused)" : "missing (expected on Pi 0.80.6)"}`);
     lines.push(`InteractiveMode.handleEvent: ${typeof prototype?.handleEvent === "function" ? "found" : "missing"}`);
