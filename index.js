@@ -363,6 +363,12 @@ function inspectToolBatch(message, results) {
   if (calls.length === 0) {
     return undefined;
   }
+  if (calls.some((call) => {
+    const name = String(call?.name ?? "").toLowerCase().split(/[.:/]/).at(-1);
+    return name === "subagent" || name.endsWith("_subagent");
+  })) {
+    return { valid: false, complete: false, calls, results: [] };
+  }
 
   const callIds = new Set();
   for (const call of calls) {
@@ -740,11 +746,11 @@ function formatToolBatchSummary(batch) {
   return parts.join("、");
 }
 
-function formatToolBatchFoldMarker(batch, config) {
+function formatToolBatchFoldMarker(batch, config, ctx) {
   const template = config.toolBatchFoldMarker || DEFAULT_CONFIG.toolBatchFoldMarker;
   const summary = formatToolBatchSummary(batch);
   const errors = `；${batch.counts.errors} 个错误`;
-  return template
+  const marker = template
     .replaceAll("{summary}", summary)
     .replaceAll("{errors}", errors)
     .replaceAll("{chevron}", "▾")
@@ -753,9 +759,10 @@ function formatToolBatchFoldMarker(batch, config) {
     .replaceAll("{details}", `${summary}${errors}`)
     .replaceAll("{shortcut}", config.toolBatchFoldShortcut || "alt+p")
     .replaceAll("{action}", "show");
+  return themeFg(ctx, "dim", marker);
 }
 
-function projectAssistantForToolActivity(message, projection, config) {
+function projectAssistantForToolActivity(message, projection, config, ctx) {
   if (message?.role !== "assistant" || !Array.isArray(message.content) || !projection) {
     return message;
   }
@@ -772,7 +779,7 @@ function projectAssistantForToolActivity(message, projection, config) {
       return [];
     }
     markerAdded = true;
-    return [{ type: "text", text: formatToolBatchFoldMarker(projection.segment, config) }];
+    return [{ type: "text", text: formatToolBatchFoldMarker(projection.segment, config, ctx) }];
   });
   return { ...message, content };
 }
@@ -1320,6 +1327,7 @@ async function patchAssistantRenderer(ctx, config) {
     && currentPatch?.owner === INSTANCE_ID
   ) {
     currentPatch.config = config;
+    currentPatch.ctx = ctx;
     patchedAssistantPrototype = prototype;
     safeSetStatus(ctx, "codex-compact-render", undefined);
     return true;
@@ -1340,6 +1348,7 @@ async function patchAssistantRenderer(ctx, config) {
     owner: INSTANCE_ID,
     originalUpdateContent,
     config,
+    ctx,
   };
   prototype.updateContent = function patchedUpdateContent(message) {
     const patchData = prototype[RENDER_PATCH_DATA_SYMBOL];
@@ -1355,7 +1364,7 @@ async function patchAssistantRenderer(ctx, config) {
       }
       if (patchData.config.foldCompletedToolBatches) {
         const projection = foldedAssistantProjections.get(assistantMessageKey(sourceMessage));
-        renderMessage = projectAssistantForToolActivity(renderMessage, projection, patchData.config);
+        renderMessage = projectAssistantForToolActivity(renderMessage, projection, patchData.config, patchData.ctx);
       }
     }
     if (renderMessage && typeof renderMessage === "object" && renderMessage !== sourceMessage) {

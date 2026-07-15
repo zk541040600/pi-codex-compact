@@ -2,6 +2,7 @@ import { copyFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const extensionPath = join(__dirname, "index.cjs");
@@ -103,8 +104,8 @@ function createMockRuntime() {
       else widgets.set(key, { content, options });
     },
     theme: {
-      fg(_style, text) {
-        return text;
+      fg(style, text) {
+        return style === "dim" ? `\x1b[2m${text}\x1b[22m` : text;
       },
     },
   };
@@ -183,9 +184,13 @@ function makeBatch(responseId, timestamp, toolNames, errorIndexes = []) {
   return { assistant, calls, results };
 }
 
+function isMarkerBlock(block) {
+  return block.type === "text" && stripVTControlCharacters(block.text).startsWith("⌕ ");
+}
+
 function markerTexts(items) {
   return items.flatMap((item) => item?.role === "assistant" && Array.isArray(item.content)
-    ? item.content.filter((block) => block.type === "text" && block.text.startsWith("⌕ ")).map((block) => block.text)
+    ? item.content.filter(isMarkerBlock).map((block) => stripVTControlCharacters(block.text))
     : []);
 }
 
@@ -521,7 +526,7 @@ async function main() {
       (component) => component?.renderedMessage?.role === "assistant",
     )?.renderedMessage;
     const aliasMarker = aliasRenderedAssistant?.content.find(
-      (block) => block.type === "text" && block.text.startsWith("legacy "),
+      (block) => block.type === "text" && stripVTControlCharacters(block.text).startsWith("legacy "),
     )?.text ?? "";
     assert(aliasMarker.includes("已读取 1 个文件；0 个错误 (alt+x)"), "legacy marker alias was not normalized");
     await aliasRuntime.commands.get("codex-compact").handler("summary", aliasRuntime.ctx);
@@ -686,6 +691,10 @@ async function main() {
       assert(firstMarker.includes(expected), `tool summary missing: ${expected}`);
     }
     assert(firstMarker.includes("后台通知 1 条"), "pending RTK notice was not merged into the completed activity marker");
+    const firstMarkerBlock = fakeInteractive.renderedItems
+      .flatMap((item) => item?.role === "assistant" ? item.content : [])
+      .find(isMarkerBlock);
+    assert(firstMarkerBlock?.text.startsWith("\x1b[2m"), "activity marker did not use the dim theme style");
     assert(rtkNoticeComponent.render(100).length === 0, "completed activity left its RTK notice visible");
 
     fakeInteractive.chatContainer.addChild({ render: () => ["status boundary"] });
@@ -710,7 +719,7 @@ async function main() {
     assert(fakeInteractive.renderedItems.includes(first.results[0]), "folding cloned or rewrote a large tool result");
 
     const foldedAssistant = fakeInteractive.renderedItems.find((item) => item.responseId === first.assistant.responseId);
-    const preservedBlocks = foldedAssistant.content.filter((block) => block.type !== "text" || !block.text.startsWith("⌕ "));
+    const preservedBlocks = foldedAssistant.content.filter((block) => !isMarkerBlock(block));
     const originalNarrativeBlocks = first.assistant.content.filter((block) => block.type !== "toolCall" && block.type !== "thinking");
     assertDeepEqual(preservedBlocks, originalNarrativeBlocks, "folding changed narrative blocks or metadata");
     assert(thinkingBlockCount(fakeInteractive.renderedItems) === 0, "collapsed activity left a Thinking hidden source block");
@@ -809,7 +818,7 @@ async function main() {
     InteractiveMode.prototype.renderSessionItems.call(liveMergeInteractive, liveMergeItems);
     const liveMarkerComponent = liveMergeInteractive.assistantComponents.get(segmentFirst.assistant.responseId);
     const liveMarkerBefore = liveMarkerComponent?.lastMessage?.content.find(
-      (block) => block.type === "text" && block.text.startsWith("⌕ "),
+      isMarkerBlock,
     )?.text ?? "";
     const livePrefix = [...liveMergeInteractive.chatContainer.children];
     const liveClearCount = liveMergeInteractive.chatContainer.clearCount;
@@ -838,7 +847,7 @@ async function main() {
     await InteractiveMode.prototype.handleEvent.call(liveMergeInteractive, liveSecondTurnEnd);
 
     const liveMarkerAfter = liveMarkerComponent?.lastMessage?.content.find(
-      (block) => block.type === "text" && block.text.startsWith("⌕ "),
+      isMarkerBlock,
     )?.text ?? "";
     assert(liveMarkerBefore !== liveMarkerAfter, "consecutive live batch did not update the existing marker");
     assert(liveMarkerAfter.includes("修改 1 次") && liveMarkerAfter.includes("1 个错误"), "live marker did not aggregate the appended batch");
@@ -900,7 +909,7 @@ async function main() {
       assert(segmentMarker.includes(expected), `activity segment summary missing: ${expected}`);
     }
     const segmentNarrative = segmentInteractive.renderedItems.flatMap((item) => item?.role === "assistant"
-      ? item.content.filter((block) => block.type === "text" && !block.text.startsWith("⌕ "))
+      ? item.content.filter((block) => block.type === "text" && !isMarkerBlock(block))
       : []);
     assertDeepEqual(
       segmentNarrative,
@@ -1032,6 +1041,14 @@ async function main() {
       InteractiveMode.prototype.renderSessionItems.call(fakeInteractive, [wrongStopReason.assistant, ...wrongStopReason.results]);
       assert(toolCallCount(fakeInteractive.renderedItems) === 1, `${stopReason} assistant message must fail open`);
       assert(markerTexts(fakeInteractive.renderedItems).length === 0, `${stopReason} assistant message received a fold marker`);
+    }
+
+    for (const toolName of ["subagent", "trellis_subagent"]) {
+      const subagentBatch = makeBatch(`${toolName}_batch`, 120, ["read", toolName]);
+      InteractiveMode.prototype.renderSessionItems.call(fakeInteractive, [subagentBatch.assistant, ...subagentBatch.results]);
+      assert(toolCallCount(fakeInteractive.renderedItems) === 2, `${toolName} batch was folded`);
+      assert(thinkingBlockCount(fakeInteractive.renderedItems) === 1, `${toolName} thinking was folded`);
+      assert(markerTexts(fakeInteractive.renderedItems).length === 0, `${toolName} batch received a fold marker`);
     }
 
     const customCountBeforeAgentEnd = runtime.customEntries.length;
